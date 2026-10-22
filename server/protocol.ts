@@ -13,7 +13,10 @@ export type ServerEvent =
   | { type: 'player_kicked'; roomCode: string }
   | { type: 'room_closed'; roomCode: string; reason: string }
   | { type: 'pong' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: RoomErrorCode; fatal?: boolean };
+
+/** fatal-ошибки означают, что переподключаться к этой комнате бессмысленно. */
+export type RoomErrorCode = 'invalid_room' | 'room_not_found' | 'room_stale' | 'room_full' | 'kicked' | 'bad_request';
 
 export type ClientMessage =
   | { type: 'identify'; roomCode: string; playerName: string; gender?: import('./shared-types.js').Gender; playerId?: string; sessionId?: string; wantsHost?: boolean; is16Plus?: boolean }

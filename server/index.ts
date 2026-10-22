@@ -1,4 +1,4 @@
-import { createServer, type IncomingMessage } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { extname, join, resolve } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -8,9 +8,9 @@ interface AliveWebSocket extends WebSocket {
   replaced?: boolean;
 }
 import { generateRoomCode, isValidRoomCode } from '../src/lib/roomCode.js';
-import { ClientMessage, ServerEvent } from './protocol.js';
-import { PlayerAction } from './shared-types.js';
-import { Room } from './room.js';
+import { ClientMessage, RoomErrorCode, ServerEvent } from './protocol.js';
+import { GameState, PlayerAction } from './shared-types.js';
+import { Room, RoomError } from './room.js';
 
 const PORT = Number(process.env.PORT || 8080);
 const HOST = '0.0.0.0';
@@ -27,76 +27,137 @@ const MIME_TYPES: Record<string, string> = {
   '.jpeg': 'image/jpeg',
   '.webp': 'image/webp',
   '.ico': 'image/x-icon',
+  '.txt': 'text/plain; charset=utf-8',
 };
 
 const rooms = new Map<string, Room>();
 const sockets = new Map<WebSocket, { roomCode: string | null; playerId: string | null; sessionId: string | null; intentionalLeave: boolean }>();
-const disconnectTimers = new Map<string, NodeJS.Timeout>();
 const MAX_JSON_BODY_BYTES = 64 * 1024;
+const MAX_WS_MESSAGE_BYTES = 64 * 1024;
+/** Окно склейки рассылок: при 15 игроках всплеск реакций иначе даёт сотни сообщений подряд. */
+const BROADCAST_COALESCE_MS = 25;
+const PRESENCE_SWEEP_MS = 5000;
+/** Клиент резервного режима опрашивает раз в 2 с; 20 с тишины — он ушёл. */
+const HTTP_PRESENCE_TIMEOUT_MS = 20000;
 
 function send(socket: WebSocket, event: ServerEvent) {
-  if (socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify(event));
+  sendRaw(socket, JSON.stringify(event));
+}
+
+function sendRaw(socket: WebSocket, payload: string) {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  try {
+    socket.send(payload);
+  } catch (error) {
+    console.warn('[ws] send failed', error);
   }
+}
+
+function sendFatalError(socket: WebSocket, code: RoomErrorCode, message: string) {
+  send(socket, { type: 'error', message, code, fatal: true });
+  socket.close();
 }
 
 function broadcast(roomCode: string, event: ServerEvent, filter?: (socket: WebSocket) => boolean) {
+  const payload = JSON.stringify(event);
   for (const [socket, meta] of sockets.entries()) {
     if (meta.roomCode !== roomCode) continue;
     if (filter && !filter(socket)) continue;
-    send(socket, event);
+    sendRaw(socket, payload);
   }
 }
 
-function buildRoomSnapshot(room: Room, playerId: string | null) {
-  const gameState = room.gameState;
-  const filteredGameState = gameState
-    ? {
-        ...gameState,
-        players: gameState.players.map((player) => ({
-          ...player,
-          hand: player.id === playerId ? player.hand : [],
-        })),
-        answerReactions: room.getAnswerReactions(),
-        myAnswerReactions: room.getMyAnswerReactions(playerId),
-        funnyVoteCounts: room.getPublicFunnyVoteCounts(),
-        myFunnyVoteId: room.getMyFunnyVoteId(playerId),
-      }
-    : null;
-
+function buildLobbyEvent(room: Room): Extract<ServerEvent, { type: 'lobby_state' }> {
   return {
-    lobby: {
-      roomCode: room.code,
-      players: room.getLobbyPlayers(),
-      ownerId: room.ownerId,
-      gameInProgress: Boolean(gameState && gameState.phase !== 'gameOver'),
-    },
-    game: filteredGameState,
+    type: 'lobby_state',
+    roomCode: room.code,
+    players: room.getLobbyPlayers(),
+    ownerId: room.ownerId,
+    gameInProgress: room.isGameInProgress(),
   };
 }
 
-function broadcastRoomState(room: Room) {
-  const snapshot = buildRoomSnapshot(room, null);
-  broadcast(room.code, {
-    type: 'lobby_state',
-    ...snapshot.lobby,
-  });
+function buildPlayerGameState(
+  room: Room,
+  playerId: string | null,
+  shared = { answerReactions: room.getAnswerReactions(), funnyVoteCounts: room.getPublicFunnyVoteCounts() },
+): GameState | null {
+  const gameState = room.gameState;
+  if (!gameState) return null;
+  return {
+    ...gameState,
+    players: gameState.players.map((player) => ({
+      ...player,
+      hand: player.id === playerId ? player.hand : [],
+    })),
+    answerReactions: shared.answerReactions,
+    myAnswerReactions: room.getMyAnswerReactions(playerId),
+    funnyVoteCounts: shared.funnyVoteCounts,
+    myFunnyVoteId: room.getMyFunnyVoteId(playerId),
+  };
+}
 
-  if (room.gameState) {
-    for (const [socket, meta] of sockets.entries()) {
-      if (meta.roomCode !== room.code || !meta.playerId) continue;
-      const playerState = structuredClone(room.gameState);
-      playerState.players = playerState.players.map((player) => ({
-        ...player,
-        hand: player.id === meta.playerId ? player.hand : [],
-      }));
-      playerState.answerReactions = room.getAnswerReactions();
-      playerState.myAnswerReactions = room.getMyAnswerReactions(meta.playerId);
-      playerState.funnyVoteCounts = room.getPublicFunnyVoteCounts();
-      playerState.myFunnyVoteId = room.getMyFunnyVoteId(meta.playerId);
-      send(socket, { type: 'game_state', state: playerState });
+function buildRoomSnapshot(room: Room, playerId: string | null) {
+  const { type: _type, ...lobby } = buildLobbyEvent(room);
+  return { lobby, game: buildPlayerGameState(room, playerId) };
+}
+
+/** Полный снимок одному сокету: после identify и по запросу синхронизации. */
+function sendRoomSnapshot(socket: WebSocket, room: Room, playerId: string | null) {
+  send(socket, buildLobbyEvent(room));
+  const state = buildPlayerGameState(room, playerId);
+  if (state) send(socket, { type: 'game_state', state });
+}
+
+const lastLobbyPayloads = new WeakMap<Room, string>();
+
+function broadcastRoomState(room: Room) {
+  // Неизменившееся лобби не рассылаем повторно: новые сокеты получают снимок напрямую при identify.
+  const lobbyPayload = JSON.stringify(buildLobbyEvent(room));
+  const lobbyChanged = lastLobbyPayloads.get(room) !== lobbyPayload;
+  lastLobbyPayloads.set(room, lobbyPayload);
+  const shared = room.gameState
+    ? { answerReactions: room.getAnswerReactions(), funnyVoteCounts: room.getPublicFunnyVoteCounts() }
+    : null;
+
+  for (const [socket, meta] of sockets.entries()) {
+    if (meta.roomCode !== room.code) continue;
+    if (lobbyChanged) sendRaw(socket, lobbyPayload);
+    if (shared && meta.playerId) {
+      const state = buildPlayerGameState(room, meta.playerId, shared);
+      if (state) send(socket, { type: 'game_state', state });
     }
   }
+}
+
+const scheduledBroadcasts = new Set<Room>();
+
+function scheduleBroadcast(room: Room) {
+  if (scheduledBroadcasts.has(room)) return;
+  scheduledBroadcasts.add(room);
+  setTimeout(() => {
+    scheduledBroadcasts.delete(room);
+    if (rooms.get(room.code) === room) broadcastRoomState(room);
+  }, BROADCAST_COALESCE_MS);
+}
+
+function deleteRoom(roomCode: string, room: Room) {
+  room.endRoom();
+  room.setStateChangeListener(null);
+  scheduledBroadcasts.delete(room);
+  if (rooms.get(roomCode) === room) rooms.delete(roomCode);
+}
+
+function sendJson(res: ServerResponse, statusCode: number, body: unknown) {
+  res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.end(JSON.stringify(body));
+}
+
+function identifyErrorStatus(error: unknown): { status: number; code: RoomErrorCode } {
+  if (error instanceof RoomError) {
+    return { status: error.code === 'kicked' ? 403 : error.code === 'room_full' ? 409 : 400, code: error.code };
+  }
+  return { status: 400, code: 'bad_request' };
 }
 
 class HttpRequestError extends Error {
@@ -146,13 +207,6 @@ function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
 }
 
 function attachPlayer(socket: WebSocket, roomCode: string, playerId: string, sessionId: string) {
-  const disconnectKey = `${roomCode}:${playerId}`;
-  const existingTimer = disconnectTimers.get(disconnectKey);
-  if (existingTimer) {
-    clearTimeout(existingTimer);
-    disconnectTimers.delete(disconnectKey);
-  }
-
   for (const [candidateSocket, candidateMeta] of sockets.entries()) {
     if (candidateSocket === socket) continue;
     if (candidateMeta.roomCode === roomCode && candidateMeta.playerId === playerId) {
@@ -168,6 +222,14 @@ function attachPlayer(socket: WebSocket, roomCode: string, playerId: string, ses
 
   sockets.set(socket, { roomCode, playerId, sessionId, intentionalLeave: false });
   console.log(`[ws] attached ${playerId.slice(0, 8)} in ${roomCode}, active sockets=${sockets.size}`);
+}
+
+function closeRoomForEveryone(roomCode: string, room: Room, reason: string) {
+  broadcast(roomCode, { type: 'room_closed', roomCode, reason });
+  for (const [candidateSocket, candidateMeta] of sockets.entries()) {
+    if (candidateMeta.roomCode === roomCode) candidateSocket.close();
+  }
+  deleteRoom(roomCode, room);
 }
 
 function cleanupSocket(socket: WebSocket) {
@@ -194,31 +256,23 @@ function cleanupSocket(socket: WebSocket) {
 
     if (wasOwner) {
       console.log(`[room] host left, closing ${meta.roomCode}`);
-      for (const [candidateSocket, candidateMeta] of sockets.entries()) {
-        if (candidateMeta.roomCode === meta.roomCode) {
-          send(candidateSocket, { type: 'room_closed', roomCode: meta.roomCode, reason: 'host_left' });
-          candidateSocket.close();
-        }
-      }
-      room.endRoom();
-      rooms.delete(meta.roomCode);
+      closeRoomForEveryone(meta.roomCode, room, 'host_left');
       return;
     }
 
     if (room.players.size === 0) {
       console.log(`[room] empty after leave, removing ${meta.roomCode}`);
-      room.endRoom();
-      rooms.delete(meta.roomCode);
+      deleteRoom(meta.roomCode, room);
       return;
     }
 
-    broadcastRoomState(room);
+    scheduleBroadcast(room);
     return;
   }
 
   if (!room.resolveSession(meta.sessionId) && room.playerHasSession(meta.playerId)) {
     console.log(`[ws] stale socket closed while ${meta.playerId.slice(0, 8)} has a newer session in ${meta.roomCode}`);
-    broadcastRoomState(room);
+    scheduleBroadcast(room);
     return;
   }
 
@@ -227,12 +281,14 @@ function cleanupSocket(socket: WebSocket) {
     room.pruneExpiredLobbyReservations();
     if (room.players.size === 0) {
       console.log(`[room] empty after disconnect, removing ${meta.roomCode}`);
-      room.endRoom();
-      rooms.delete(meta.roomCode);
+      deleteRoom(meta.roomCode, room);
       return;
     }
-    broadcastRoomState(room);
+  } else {
+    room.refreshPresence();
   }
+  // Раньше во время партии офлайн-статус никому не рассылался.
+  scheduleBroadcast(room);
 }
 
 async function serveStatic(urlPath: string) {
@@ -242,37 +298,65 @@ async function serveStatic(urlPath: string) {
     const content = await readFile(filePath);
     return {
       status: 200,
-      headers: { 'content-type': MIME_TYPES[extname(filePath)] || 'application/octet-stream' },
+      headers: {
+        'content-type': MIME_TYPES[extname(filePath)] || 'application/octet-stream',
+        // Файлы в /assets/ содержат хэш в имени; index.html должен перепроверяться после каждого деплоя.
+        'cache-control': normalized.startsWith('/assets/') ? 'public, max-age=31536000, immutable' : 'no-cache',
+      },
       body: content,
     };
   } catch {
+    if (normalized.startsWith('/assets/')) {
+      // Вместо index.html под видом JS (белый экран у клиентов со старой вкладкой после деплоя).
+      return { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }, body: 'Not found' };
+    }
     const fallback = await readFile(join(DIST_DIR, 'index.html'));
     return {
       status: 200,
-      headers: { 'content-type': 'text/html; charset=utf-8' },
+      headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' },
       body: fallback,
     };
   }
 }
 
-const server = createServer(async (req, res) => {
-  const url = new URL(req.url || '/', `http://${req.headers.host}`);
+function createRoom() {
+  let roomCode = generateRoomCode();
+  while (rooms.has(roomCode)) roomCode = generateRoomCode();
+  const room = new Room(roomCode);
+  room.setStateChangeListener(() => scheduleBroadcast(room));
+  rooms.set(roomCode, room);
+  console.log(`[room] created ${roomCode}, total rooms=${rooms.size}`);
+  return room;
+}
+
+function closePlayerSockets(roomCode: string, playerId: string, event?: ServerEvent) {
+  for (const [candidateSocket, candidateMeta] of sockets.entries()) {
+    if (candidateMeta.roomCode === roomCode && candidateMeta.playerId === playerId) {
+      if (event) send(candidateSocket, event);
+      candidateSocket.close();
+    }
+  }
+}
+
+/** HTTP-запрос с валидной сессией — признак жизни игрока в резервном режиме. */
+function notePlayerSeen(room: Room, playerId: string) {
+  if (room.markSeen(playerId)) {
+    room.refreshPresence();
+    scheduleBroadcast(room);
+  }
+}
+
+async function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
+  const url = new URL(req.url || '/', 'http://localhost');
 
   if (req.method === 'GET' && url.pathname === '/api/health') {
-    console.log(`[health] ${req.method} ${url.pathname} rooms=${rooms.size}`);
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ ok: true, rooms: rooms.size }));
+    sendJson(res, 200, { ok: true, rooms: rooms.size, sockets: sockets.size });
     return;
   }
 
   if (req.method === 'POST' && url.pathname === '/api/rooms') {
-    const roomCode = generateRoomCode();
-    const room = new Room(roomCode);
-    room.setStateChangeListener(() => broadcastRoomState(room));
-    rooms.set(roomCode, room);
-    console.log(`[room] created ${roomCode}, total rooms=${rooms.size}`);
-    res.writeHead(201, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({ roomCode }));
+    const room = createRoom();
+    sendJson(res, 201, { roomCode: room.code });
     return;
   }
 
@@ -283,8 +367,7 @@ const server = createServer(async (req, res) => {
     const room = rooms.get(roomCode);
 
     if (!room) {
-      res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: 'Комната не найдена' }));
+      sendJson(res, 404, { error: 'Комната не найдена', code: 'room_not_found' });
       return;
     }
 
@@ -292,13 +375,11 @@ const server = createServer(async (req, res) => {
       const sessionId = url.searchParams.get('sessionId') || undefined;
       const session = sessionId ? room.resolveSession(sessionId) : null;
       if (!session) {
-        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'Сессия не найдена' }));
+        sendJson(res, 401, { error: 'Сессия не найдена' });
         return;
       }
-      const snapshot = buildRoomSnapshot(room, session.playerId);
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify(snapshot));
+      notePlayerSeen(room, session.playerId);
+      sendJson(res, 200, buildRoomSnapshot(room, session.playerId));
       return;
     }
 
@@ -308,8 +389,7 @@ const server = createServer(async (req, res) => {
     } catch (error) {
       const statusCode = error instanceof HttpRequestError ? error.statusCode : 400;
       const message = error instanceof Error ? error.message : 'Некорректный запрос';
-      res.writeHead(statusCode, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: message }));
+      sendJson(res, statusCode, { error: message });
       return;
     }
 
@@ -323,105 +403,91 @@ const server = createServer(async (req, res) => {
         const effectiveGender = (body.gender === 'female' ? 'female' : 'male') as ('male' | 'female');
         const joined = room.addOrUpdatePlayer(resolvedPlayerId, effectiveName, effectiveWantsHost, effectiveGender);
         const newSessionId = room.refreshSession(String(body.sessionId || ''), resolvedPlayerId, joined.player.name, joined.player.isHost);
-        broadcastRoomState(room);
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({
+        room.refreshPresence();
+        scheduleBroadcast(room);
+        sendJson(res, 200, {
           playerId: resolvedPlayerId,
           roomCode,
           sessionId: newSessionId,
           isHost: joined.player.isHost,
-        }));
-        return;
+        });
       } catch (error) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Не удалось войти в комнату' }));
-        return;
+        const { status, code } = identifyErrorStatus(error);
+        sendJson(res, status, { error: error instanceof Error ? error.message : 'Не удалось войти в комнату', code });
       }
+      return;
     }
 
     const sessionId = typeof body.sessionId === 'string' ? body.sessionId : undefined;
     const session = sessionId ? room.resolveSession(sessionId) : null;
 
     if (!session) {
-      res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ error: 'Сессия не найдена' }));
+      sendJson(res, 401, { error: 'Сессия не найдена' });
       return;
     }
 
     const playerId = session.playerId;
+    notePlayerSeen(room, playerId);
 
     if (endpoint === 'actions') {
       try {
         const action = body.action as PlayerAction;
-        if (!action || typeof action.type !== 'string') {
-          res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ error: 'Неверное действие' }));
+        if (!action || typeof action !== 'object' || typeof action.type !== 'string') {
+          sendJson(res, 400, { error: 'Неверное действие' });
           return;
         }
         room.processAction(playerId, { ...action, playerId });
-        broadcastRoomState(room);
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
-        return;
+        scheduleBroadcast(room);
+        sendJson(res, 200, { ok: true });
       } catch (error) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Не удалось обработать действие' }));
-        return;
+        sendJson(res, 400, { error: error instanceof Error ? error.message : 'Не удалось обработать действие' });
       }
+      return;
     }
 
     if (endpoint === 'start') {
       if (room.ownerId !== playerId) {
-        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'Только хост может начать игру' }));
+        sendJson(res, 403, { error: 'Только хост может начать игру' });
+        return;
+      }
+      if (room.isGameInProgress()) {
+        // Повторный старт (двойной клик, повтор запроса) не должен сбрасывать идущую партию.
+        sendJson(res, 200, { ok: true, alreadyStarted: true });
         return;
       }
       try {
         room.startGame(Boolean(body.is16Plus));
-        broadcastRoomState(room);
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
+        scheduleBroadcast(room);
+        sendJson(res, 200, { ok: true });
       } catch (error) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Не удалось начать игру' }));
+        sendJson(res, 400, { error: error instanceof Error ? error.message : 'Не удалось начать игру' });
       }
       return;
     }
 
     if (endpoint === 'kick') {
       if (room.ownerId !== playerId) {
-        res.writeHead(403, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'Только хост может удалять игроков' }));
+        sendJson(res, 403, { error: 'Только хост может удалять игроков' });
         return;
       }
       const targetPlayerId = String(body.playerId || '');
-      if (!targetPlayerId) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: 'Не указан игрок' }));
+      if (!targetPlayerId || targetPlayerId === playerId) {
+        sendJson(res, 400, { error: 'Не указан игрок' });
         return;
       }
       try {
         room.kickPlayer(targetPlayerId);
-        for (const [candidateSocket, candidateMeta] of sockets.entries()) {
-          if (candidateMeta.roomCode === roomCode && candidateMeta.playerId === targetPlayerId) {
-            send(candidateSocket, { type: 'player_kicked', roomCode });
-            candidateSocket.close();
-          }
-        }
-        broadcastRoomState(room);
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true }));
+        closePlayerSockets(roomCode, targetPlayerId, { type: 'player_kicked', roomCode });
+        scheduleBroadcast(room);
+        sendJson(res, 200, { ok: true });
       } catch (error) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Не удалось удалить игрока' }));
+        sendJson(res, 400, { error: error instanceof Error ? error.message : 'Не удалось удалить игрока' });
       }
       return;
     }
 
     if (endpoint === 'sync') {
-      broadcastRoomState(room);
-      res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: true }));
+      sendJson(res, 200, { ok: true, ...buildRoomSnapshot(room, playerId) });
       return;
     }
 
@@ -433,32 +499,21 @@ const server = createServer(async (req, res) => {
 
         if (wasOwner) {
           console.log(`[room] host left via HTTP, closing ${roomCode}`);
-          for (const [candidateSocket, candidateMeta] of sockets.entries()) {
-            if (candidateMeta.roomCode === roomCode) {
-              send(candidateSocket, { type: 'room_closed', roomCode, reason: 'host_left' });
-              candidateSocket.close();
-            }
-          }
-          room.endRoom();
-          rooms.delete(roomCode);
-          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ ok: true, roomClosed: true }));
+          closeRoomForEveryone(roomCode, room, 'host_left');
+          sendJson(res, 200, { ok: true, roomClosed: true });
           return;
         }
 
+        closePlayerSockets(roomCode, playerId);
         if (room.players.size === 0) {
           console.log(`[room] empty after HTTP leave, removing ${roomCode}`);
-          room.endRoom();
-          rooms.delete(roomCode);
+          deleteRoom(roomCode, room);
         } else {
-          broadcastRoomState(room);
+          scheduleBroadcast(room);
         }
-
-        res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, roomClosed: false }));
+        sendJson(res, 200, { ok: true, roomClosed: false });
       } catch (error) {
-        res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ error: error instanceof Error ? error.message : 'Не удалось выйти' }));
+        sendJson(res, 400, { error: error instanceof Error ? error.message : 'Не удалось выйти' });
       }
       return;
     }
@@ -467,24 +522,42 @@ const server = createServer(async (req, res) => {
   if (req.method === 'GET' && url.pathname.startsWith('/api/rooms/')) {
     const roomCode = url.pathname.split('/')[3]?.trim().toUpperCase();
     const room = roomCode ? rooms.get(roomCode) : null;
-    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-    res.end(JSON.stringify({
+    sendJson(res, 200, {
       exists: Boolean(room),
       players: room ? room.players.size : 0,
-      gameInProgress: Boolean(room?.gameState && room.gameState.phase !== 'gameOver'),
+      gameInProgress: Boolean(room?.isGameInProgress()),
       isStale: room ? room.isStale() : false,
-    }));
+    });
+    return;
+  }
+
+  if (url.pathname.startsWith('/api/')) {
+    sendJson(res, 404, { error: 'Не найдено' });
     return;
   }
 
   const staticFile = await serveStatic(url.pathname);
   res.writeHead(staticFile.status, staticFile.headers);
   res.end(staticFile.body);
+}
+
+const server = createServer((req, res) => {
+  // Необработанная ошибка в async-обработчике раньше роняла весь процесс вместе со всеми комнатами.
+  handleHttpRequest(req, res).catch((error) => {
+    console.error('[http] request failed', req.method, req.url, error);
+    if (!res.headersSent) {
+      sendJson(res, 500, { error: 'Внутренняя ошибка сервера' });
+    } else {
+      res.end();
+    }
+  });
 });
 
 const wss = new WebSocketServer({
   server,
   path: '/ws',
+  // По умолчанию ws принимает сообщения до 100 МБ.
+  maxPayload: MAX_WS_MESSAGE_BYTES,
   perMessageDeflate: {
     // Only compress messages larger than 1KB to avoid overhead on tiny messages
     threshold: 1024,
@@ -507,7 +580,7 @@ wss.on('connection', (socket: AliveWebSocket) => {
       socket.lastSeenAt = Date.now();
       const message = JSON.parse(raw.toString()) as ClientMessage;
       const meta = sockets.get(socket);
-      if (!meta) return;
+      if (!meta || !message || typeof message !== 'object') return;
 
       if (message.type === 'ping') {
         send(socket, { type: 'pong' });
@@ -516,33 +589,29 @@ wss.on('connection', (socket: AliveWebSocket) => {
 
       if (message.type === 'identify') {
         try {
-          const roomCode = message.roomCode.trim().toUpperCase();
+          const roomCode = String(message.roomCode ?? '').trim().toUpperCase();
           if (!isValidRoomCode(roomCode)) {
-            send(socket, { type: 'error', message: 'Неверный код комнаты' });
-            socket.close();
+            sendFatalError(socket, 'invalid_room', 'Неверный код комнаты');
             return;
           }
 
           const room = rooms.get(roomCode);
           if (!room) {
-            send(socket, { type: 'error', message: 'Комната не найдена' });
-            socket.close();
+            sendFatalError(socket, 'room_not_found', 'Комната не найдена — возможно, сервер перезапускался или игра закончилась');
             return;
           }
 
           room.pruneExpiredLobbyReservations();
           if (room.isStale()) {
             console.log(`[room] stale cleanup ${roomCode}`);
-            room.endRoom();
-            rooms.delete(roomCode);
-            send(socket, { type: 'error', message: 'Комната устарела и была очищена' });
-            socket.close();
+            deleteRoom(roomCode, room);
+            sendFatalError(socket, 'room_stale', 'Комната устарела и была очищена');
             return;
           }
 
-          console.log(`[ws] identify ${roomCode} from ${message.playerName}, room exists=${rooms.has(roomCode)}, players=${room.players.size}`);
+          const requestedName = String(message.playerName ?? '').trim();
+          console.log(`[ws] identify ${roomCode} from ${requestedName.slice(0, 24)}, players=${room.players.size}`);
 
-          const requestedName = message.playerName.trim();
           const restoredSession = room.resolveSession(message.sessionId);
           const playerId = resolveIdentifyPlayerId(room, message.playerId, restoredSession);
           const effectiveName = restoredSession?.playerName || requestedName;
@@ -551,13 +620,15 @@ wss.on('connection', (socket: AliveWebSocket) => {
           const joined = room.addOrUpdatePlayer(playerId, effectiveName, effectiveWantsHost, effectiveGender);
           const sessionId = room.refreshSession(message.sessionId, playerId, joined.player.name, joined.player.isHost);
           attachPlayer(socket, roomCode, playerId, sessionId);
+          room.refreshPresence();
 
           send(socket, { type: 'connected', playerId, roomCode, sessionId, isHost: joined.player.isHost });
-          broadcastRoomState(room);
+          sendRoomSnapshot(socket, room, playerId);
+          scheduleBroadcast(room);
           return;
         } catch (error) {
-          send(socket, { type: 'error', message: error instanceof Error ? error.message : 'Не удалось войти в комнату' });
-          socket.close();
+          const { code } = identifyErrorStatus(error);
+          sendFatalError(socket, code, error instanceof Error ? error.message : 'Не удалось войти в комнату');
           return;
         }
       }
@@ -578,14 +649,20 @@ wss.on('connection', (socket: AliveWebSocket) => {
           send(socket, { type: 'error', message: 'Только хост может начать игру' });
           return;
         }
+        if (room.isGameInProgress()) {
+          // Повторный старт (двойной клик, повтор после переподключения) не должен сбрасывать партию.
+          sendRoomSnapshot(socket, room, meta.playerId);
+          return;
+        }
         room.startGame(Boolean(message.is16Plus));
-        broadcastRoomState(room);
+        scheduleBroadcast(room);
         return;
       }
 
       if (message.type === 'request_sync') {
         console.log(`[ws] sync requested by ${meta.playerId?.slice(0, 8)} in ${meta.roomCode}`);
-        broadcastRoomState(room);
+        // Снимок только запросившему: раньше каждое нажатие рассылалось всей комнате.
+        sendRoomSnapshot(socket, room, meta.playerId);
         return;
       }
 
@@ -594,14 +671,11 @@ wss.on('connection', (socket: AliveWebSocket) => {
           send(socket, { type: 'error', message: 'Только хост может удалять игроков' });
           return;
         }
-        room.kickPlayer(message.playerId);
-        for (const [candidateSocket, candidateMeta] of sockets.entries()) {
-          if (candidateMeta.roomCode === meta.roomCode && candidateMeta.playerId === message.playerId) {
-            send(candidateSocket, { type: 'player_kicked', roomCode: meta.roomCode });
-            candidateSocket.close();
-          }
-        }
-        broadcastRoomState(room);
+        const targetPlayerId = typeof message.playerId === 'string' ? message.playerId : '';
+        if (!targetPlayerId || targetPlayerId === meta.playerId) return;
+        room.kickPlayer(targetPlayerId);
+        closePlayerSockets(meta.roomCode, targetPlayerId, { type: 'player_kicked', roomCode: meta.roomCode });
+        scheduleBroadcast(room);
         return;
       }
 
@@ -616,15 +690,17 @@ wss.on('connection', (socket: AliveWebSocket) => {
       }
 
       if (message.type === 'player_action') {
-        const actionId = typeof message.action.actionId === 'string' ? message.action.actionId : null;
+        const action = message.action && typeof message.action === 'object' ? message.action : null;
+        const actionId = action && typeof action.actionId === 'string' ? action.actionId : null;
         try {
-          room.processAction(meta.playerId, { ...message.action, playerId: meta.playerId } as PlayerAction);
-          broadcastRoomState(room);
+          if (!action || typeof action.type !== 'string') throw new Error('Неверное действие');
+          room.processAction(meta.playerId, { ...action, playerId: meta.playerId } as PlayerAction);
+          scheduleBroadcast(room);
         } catch (error) {
           send(socket, {
             type: 'action_rejected',
             reason: error instanceof Error ? error.message : 'Не удалось обработать действие',
-            actionType: message.action.type,
+            actionType: action?.type,
           });
         } finally {
           // Acknowledging duplicates as well as first deliveries lets clients
@@ -643,14 +719,35 @@ wss.on('connection', (socket: AliveWebSocket) => {
   });
 });
 
+function connectedPlayerKeys() {
+  const keys = new Set<string>();
+  for (const meta of sockets.values()) {
+    if (meta.roomCode && meta.playerId) keys.add(`${meta.roomCode}:${meta.playerId}`);
+  }
+  return keys;
+}
+
+// Присутствие: офлайн-игроки резервного режима и игроки, которых раунд больше не ждёт.
+setInterval(() => {
+  const withSocket = connectedPlayerKeys();
+  for (const room of rooms.values()) {
+    try {
+      const lobbyChanged = room.expireSilentPlayers((playerId) => withSocket.has(`${room.code}:${playerId}`), HTTP_PRESENCE_TIMEOUT_MS);
+      const gameChanged = room.refreshPresence();
+      if (lobbyChanged || gameChanged) scheduleBroadcast(room);
+    } catch (error) {
+      console.error(`[presence] sweep failed for ${room.code}`, error);
+    }
+  }
+}, PRESENCE_SWEEP_MS);
+
 setInterval(() => {
   for (const [roomCode, room] of rooms.entries()) {
-    if (room.gameState) continue;
     room.pruneExpiredLobbyReservations();
+    // Раньше комнаты с начатой партией не удалялись никогда (утечка памяти до перезапуска).
     if (room.isStale()) {
       console.log(`[room] stale cleanup ${roomCode}`);
-      room.endRoom();
-      rooms.delete(roomCode);
+      closeRoomForEveryone(roomCode, room, 'stale');
     }
   }
 }, 60 * 1000);
@@ -670,6 +767,19 @@ setInterval(() => {
     socket.ping();
   }
 }, PING_INTERVAL_MS);
+
+// Сервер держит все комнаты в памяти: одна непойманная ошибка не должна обрывать игру всем.
+process.on('unhandledRejection', (reason) => {
+  console.error('[process] unhandled rejection', reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[process] uncaught exception', error);
+});
+
+server.on('error', (error) => {
+  console.error('[http] server error', error);
+  process.exit(1);
+});
 
 server.listen(PORT, HOST, () => {
   console.log(`Server listening on http://${HOST}:${PORT}, rooms in memory, ping interval=${PING_INTERVAL_MS}ms`);

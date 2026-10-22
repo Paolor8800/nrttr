@@ -81,6 +81,8 @@ export interface GameState {
   myAnswerReactions: MyAnswerReactions;
   funnyVoteCounts: FunnyVoteCounts;
   funnyVotesSubmittedCount: number;
+  /** Сколько голосов нужно, чтобы выбрать «самый смешной» (игроки не в сети не ждутся). */
+  funnyVotesRequiredCount: number;
   myFunnyVoteId: string | null;
   // Правильный ответ ведущего — показывается отдельно
   correctAnswer: string;
@@ -93,6 +95,8 @@ export interface GameState {
   lastResult: RoundResult | null;
   winnerId: string | null;
   casinoLastSpins: Record<string, CasinoSpinResult>;
+  /** Игроки партии, которые давно не в сети: раунд их больше не ждёт. */
+  awayPlayerIds: string[];
 
   // Совместимость с сетевым слоем / клиентом
   roomCode: string;
@@ -108,4 +112,9 @@ export type PlayerAction = (
   | { type: 'casino_spin'; playerId: string; payload: { betType: CasinoBetType; betNumber?: number | null } }
   | { type: 'finish_judging'; playerId: string; payload?: Record<string, never> }
   | { type: 'next_round'; playerId: string; payload?: Record<string, never> }
-) & { actionId?: string };
+) & {
+  actionId?: string;
+  /** Раунд и вопрос, для которых отправлено действие: запоздавшие действия прошлого раунда отбрасываются. */
+  round?: number;
+  questionId?: string | null;
+};

@@ -1,14 +1,35 @@
 import { generateRoomCode } from '../src/lib/roomCode.js';
+import { MAX_PLAYERS, MAX_PLAYER_NAME_LENGTH, MIN_PLAYERS } from '../src/lib/roomLimits.js';
 import { GameState, PlayerAction, Player, Gender, ReactionType, AnswerReactionCounts, MyAnswerReactions, FunnyVoteCounts, CasinoBetType, HOST_ANSWER_REACTION_ID } from './shared-types.js';
 import { GameEvent } from './shared-events.js';
-import { LobbyPlayer } from './protocol.js';
+import { LobbyPlayer, RoomErrorCode } from './protocol.js';
 import { pickQuestion, questionsForGender, renderQuestion } from '../src/data/questions.js';
 import { ROULETTE_NUMBERS, rouletteColorForNumber } from '../src/lib/casinoRoulette.js';
 import { buildAnonymizedAnswers, computeRoundScores, applyDeltas, pickWinnerId } from './shared-handlers.js';
 
-const MAX_PLAYERS = 10;
+function envMs(name: string, fallback: number): number {
+  const value = Number(typeof process !== 'undefined' ? process.env?.[name] : undefined);
+  return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
 const TARGET_SCORE = 20; // первый, кто набирает столько очков — победитель
 const LOBBY_RESERVATION_TTL_MS = 5 * 60 * 1000;
+const EMPTY_ROOM_TTL_MS = 5 * 60 * 1000;
+const ABANDONED_ROOM_TTL_MS = 30 * 60 * 1000;
+const PROCESSED_ACTION_IDS_LIMIT = 2000;
+/** Через столько офлайна игрок перестаёт блокировать ответы и голосование. */
+export const PLAYER_AWAY_GRACE_MS = envMs('PLAYER_AWAY_GRACE_MS', 30_000);
+/** Через столько офлайна ведущий теряет ход, иначе раунд зависает навсегда. */
+export const LEADER_AWAY_GRACE_MS = envMs('LEADER_AWAY_GRACE_MS', 60_000);
+const ROUND_BOUND_ACTIONS = new Set<PlayerAction['type']>([
+  'submit_answer',
+  'select_most_correct',
+  'guess_author',
+  'vote_funniest',
+  'toggle_answer_reaction',
+  'finish_judging',
+  'next_round',
+]);
 const CASINO_PAYOUTS: Record<CasinoBetType, number> = {
   red: 2,
   black: 2,
@@ -19,6 +40,27 @@ const CASINO_ENDGAME_FORCE_SCORES = new Set([18, 19]);
 const CASINO_FORCED_LOSS_COUNT = 5;
 
 type NormalizedCasinoBet = { betType: CasinoBetType; betNumber: number | null };
+
+export class RoomError extends Error {
+  constructor(readonly code: RoomErrorCode, message: string) {
+    super(message);
+  }
+}
+
+export function normalizePlayerName(raw: unknown): string {
+  const cleaned = String(raw ?? '')
+    .replace(/\p{Cc}+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  // Array.from не режет эмодзи (суррогатные пары) пополам.
+  return Array.from(cleaned).slice(0, MAX_PLAYER_NAME_LENGTH).join('').trim() || 'Игрок';
+}
+
+function isStaleRoundAction(action: PlayerAction, state: GameState): boolean {
+  if (!ROUND_BOUND_ACTIONS.has(action.type)) return false;
+  if (typeof action.round === 'number' && action.round !== state.round) return true;
+  return typeof action.questionId === 'string' && action.questionId !== state.questionId;
+}
 
 function normalizeCasinoBet(payload: unknown): NormalizedCasinoBet | null {
   const { betType, betNumber } = (payload ?? {}) as { betType?: unknown; betNumber?: unknown };
@@ -105,11 +147,17 @@ export class Room {
   /** Уже заданные id вопросов в серии игр этой комнаты. */
   private usedQuestionIds: string[] = [];
   private casinoForcedLosses = new Map<string, number>();
+  /** Последний выбор при ничьей за «самый смешной», чтобы он не менялся при каждом пересчёте. */
+  private funnyTieBreak: { key: string; winner: string } | null = null;
+  /** Когда игрок последний раз был виден по HTTP (резервный режим без WebSocket). */
+  private lastSeenAt = new Map<string, number>();
+  private lastActivityAt: number;
 
   constructor(code?: string) {
     this.code = code ?? generateRoomCode();
     this.ownerId = null;
     this.createdAt = Date.now();
+    this.lastActivityAt = this.createdAt;
   }
 
   static create() {
@@ -120,13 +168,17 @@ export class Room {
     this.onStateChanged = listener;
   }
 
+  isGameInProgress() {
+    return Boolean(this.gameState && this.gameState.phase !== 'gameOver');
+  }
+
   addOrUpdatePlayer(playerId: string, name: string, wantsHost: boolean, gender: Gender = 'male') {
     if (this.kickedPlayerIds.has(playerId)) {
-      throw new Error('Игрок был удалён из комнаты');
+      throw new RoomError('kicked', 'Тебя удалили из этой комнаты');
     }
 
     if (!this.players.has(playerId) && this.players.size >= MAX_PLAYERS) {
-      throw new Error('Комната заполнена');
+      throw new RoomError('room_full', `Комната заполнена (максимум ${MAX_PLAYERS} игроков)`);
     }
 
     const existing = this.players.get(playerId);
@@ -136,7 +188,7 @@ export class Room {
 
     const player: LobbyPlayer = {
       id: playerId,
-      name,
+      name: this.uniquePlayerName(playerId, normalizePlayerName(name)),
       gender,
       isHost: this.ownerId === playerId,
       connected: true,
@@ -145,7 +197,25 @@ export class Room {
     this.players.set(playerId, player);
     this.reservedPlayers.delete(playerId);
     this.reservedAt.delete(playerId);
+    this.lastSeenAt.set(playerId, Date.now());
+    this.lastActivityAt = Date.now();
     return { player, isNew: !existing };
+  }
+
+  /** Одинаковые имена мешают ведущему угадывать авторов, поэтому дубли получают номер. */
+  private uniquePlayerName(playerId: string, name: string): string {
+    const taken = new Set(
+      Array.from(this.players.values())
+        .filter((player) => player.id !== playerId)
+        .map((player) => player.name.toLocaleLowerCase('ru')),
+    );
+    if (!taken.has(name.toLocaleLowerCase('ru'))) return name;
+    for (let index = 2; index <= MAX_PLAYERS + 1; index += 1) {
+      const suffix = ` ${index}`;
+      const candidate = Array.from(name).slice(0, MAX_PLAYER_NAME_LENGTH - suffix.length).join('').trim() + suffix;
+      if (!taken.has(candidate.toLocaleLowerCase('ru'))) return candidate;
+    }
+    return name;
   }
 
   issueSession(playerId: string, playerName: string, isHost: boolean) {
@@ -195,18 +265,24 @@ export class Room {
   }
 
   canStart() {
-    return this.players.size >= 3;
+    return this.players.size >= MIN_PLAYERS;
   }
 
-  isStale() {
-    const EMPTY_ROOM_TTL_MS = 5 * 60 * 1000;
-    return this.players.size === 0 && !this.gameState && Date.now() - this.createdAt >= EMPTY_ROOM_TTL_MS;
+  /** Пустая комната живёт 5 минут, комната, где все офлайн, — 30 минут (раньше партии не чистились никогда). */
+  isStale(now = Date.now()) {
+    const anyoneConnected = Array.from(this.players.values()).some((player) => player.connected !== false);
+    if (anyoneConnected) return false;
+    const idleFor = now - this.lastActivityAt;
+    return idleFor >= (this.players.size === 0 ? EMPTY_ROOM_TTL_MS : ABANDONED_ROOM_TTL_MS);
   }
 
 
   startGame(_is16Plus?: boolean) {
-    if (this.players.size < 3) {
-      throw new Error('Нужно минимум 3 игрока');
+    if (this.isGameInProgress()) {
+      throw new Error('Игра уже идёт');
+    }
+    if (this.players.size < MIN_PLAYERS) {
+      throw new Error(`Нужно минимум ${MIN_PLAYERS} игрока`);
     }
     const lobby = this.getLobbyPlayers();
     const players: Player[] = lobby.map((p) => ({
@@ -235,6 +311,7 @@ export class Room {
       myAnswerReactions: {},
       funnyVoteCounts: {},
       funnyVotesSubmittedCount: 0,
+      funnyVotesRequiredCount: 0,
       myFunnyVoteId: null,
       correctAnswer: '',
       mostCorrectAnswerId: null,
@@ -243,10 +320,12 @@ export class Room {
       lastResult: null,
       winnerId: null,
       casinoLastSpins: {},
+      awayPlayerIds: [],
       roomCode: this.code,
       hostId: this.ownerId ?? '',
     };
     this.beginRound();
+    this.gameState.awayPlayerIds = this.getAwayPlayerIds();
     return this.gameState;
   }
 
@@ -266,6 +345,7 @@ export class Room {
     this.authorByAnswerId = {};
     this.answerReactionPlayers = {};
     this.funniestVotes.clear();
+    this.funnyTieBreak = null;
 
     state.phase = 'answering';
     state.questionId = question.id;
@@ -276,6 +356,7 @@ export class Room {
     state.myAnswerReactions = {};
     state.funnyVoteCounts = {};
     state.funnyVotesSubmittedCount = 0;
+    state.funnyVotesRequiredCount = 0;
     state.myFunnyVoteId = null;
     state.correctAnswer = '';
     state.mostCorrectAnswerId = null;
@@ -294,11 +375,14 @@ export class Room {
     }
     const { answers, authorByAnswerId } = buildAnonymizedAnswers(playerSubs);
     this.authorByAnswerId = authorByAnswerId;
+    this.funnyTieBreak = null;
+    state.submittedPlayerIds = Array.from(this.submissions.keys());
     state.answers = answers;
     state.answerReactions = {};
     state.myAnswerReactions = {};
     state.funnyVoteCounts = {};
     state.funnyVotesSubmittedCount = 0;
+    state.funnyVotesRequiredCount = this.requiredFunnyVoterIds().length;
     state.myFunnyVoteId = null;
     state.correctAnswer = this.submissions.get(leader.id) ?? '';
     state.phase = 'judging';
@@ -350,17 +434,24 @@ export class Room {
     return this.funniestVotes.get(playerId) ?? null;
   }
 
-  private allFunnyVotesReady() {
+  private requiredFunnyVoterIds(): string[] {
     const state = this.gameState!;
     const leaderId = state.players[state.currentLeaderIndex]?.id;
-    const voters = state.players.filter((player) => player.id !== leaderId).length;
-    return voters > 0 && this.funniestVotes.size >= voters;
+    return state.players
+      .filter((player) => player.id !== leaderId && !this.isPlayerAway(player.id))
+      .map((player) => player.id);
+  }
+
+  private allFunnyVotesReady() {
+    const required = this.requiredFunnyVoterIds();
+    return this.funniestVotes.size > 0 && required.every((playerId) => this.funniestVotes.has(playerId));
   }
 
   private updateFunnyVoteState() {
     const state = this.gameState!;
     state.funnyVoteCounts = this.getFunnyVoteCounts();
     state.funnyVotesSubmittedCount = this.funniestVotes.size;
+    state.funnyVotesRequiredCount = this.requiredFunnyVoterIds().length;
     state.myFunnyVoteId = null;
 
     if (!this.allFunnyVotesReady()) {
@@ -380,9 +471,16 @@ export class Room {
         winnerCandidates.push(answer.id);
       }
     }
-    state.mostFunnyAnswerId = winnerCandidates.length > 0
-      ? winnerCandidates[Math.floor(Math.random() * winnerCandidates.length)]
-      : null;
+    if (winnerCandidates.length === 0) {
+      state.mostFunnyAnswerId = null;
+      return;
+    }
+    // Пересчёт идёт и на «Завершить раунд», и по таймеру присутствия — ничья не должна перевыбираться.
+    const key = winnerCandidates.join('|');
+    if (this.funnyTieBreak?.key !== key) {
+      this.funnyTieBreak = { key, winner: winnerCandidates[Math.floor(Math.random() * winnerCandidates.length)] };
+    }
+    state.mostFunnyAnswerId = this.funnyTieBreak.winner;
   }
 
   /** Завершает раунд: начисляет очки (без раскрытия авторства). */
@@ -408,44 +506,38 @@ export class Room {
     );
   }
 
+  /** Убирает следы ушедшего игрока из судейства: его ответ, голос и догадки о нём. */
   private pruneJudgingAnswerByPlayer(playerId: string) {
     const state = this.gameState;
     if (!state || state.phase !== 'judging') return;
 
-    const removedAnswerIds = Object.entries(this.authorByAnswerId)
-      .filter(([, authorId]) => authorId === playerId)
-      .map(([answerId]) => answerId);
+    const removed = new Set(
+      Object.entries(this.authorByAnswerId)
+        .filter(([, authorId]) => authorId === playerId)
+        .map(([answerId]) => answerId),
+    );
 
-    if (removedAnswerIds.length === 0) return;
-
-    const removed = new Set(removedAnswerIds);
-    state.answers = state.answers.filter((answer) => !removed.has(answer.id));
-    for (const [voterId, answerId] of Array.from(this.funniestVotes.entries())) {
-      if (removed.has(answerId) || voterId === playerId) {
-        this.funniestVotes.delete(voterId);
+    // Голос ушедшего удаляется всегда, даже если своего ответа у него не было.
+    this.funniestVotes.delete(playerId);
+    if (removed.size > 0) {
+      state.answers = state.answers.filter((answer) => !removed.has(answer.id));
+      for (const [voterId, answerId] of Array.from(this.funniestVotes.entries())) {
+        if (removed.has(answerId)) this.funniestVotes.delete(voterId);
+      }
+      for (const answerId of removed) {
+        delete this.authorByAnswerId[answerId];
+        delete this.answerReactionPlayers[answerId];
+        delete state.authorGuesses[answerId];
+      }
+      if (state.mostCorrectAnswerId && removed.has(state.mostCorrectAnswerId)) {
+        state.mostCorrectAnswerId = null;
+        state.authorGuesses = {};
       }
     }
-    for (const answerId of removed) {
-      delete this.authorByAnswerId[answerId];
-      delete this.answerReactionPlayers[answerId];
-      delete state.authorGuesses[answerId];
-    }
-    state.answerReactions = this.getAnswerReactionCounts();
-    state.myAnswerReactions = {};
-    this.updateFunnyVoteState();
     state.authorGuesses = Object.fromEntries(
       Object.entries(state.authorGuesses).filter(([, guessedPlayerId]) => guessedPlayerId !== playerId),
     );
-
-    if (state.mostCorrectAnswerId && removed.has(state.mostCorrectAnswerId)) {
-      state.mostCorrectAnswerId = null;
-      state.authorGuesses = {};
-    }
-
-    if (state.mostFunnyAnswerId && removed.has(state.mostFunnyAnswerId)) {
-      state.mostFunnyAnswerId = null;
-      state.authorGuesses = {};
-    }
+    this.updateFunnyVoteState();
   }
 
   /** Передаёт ход следующему ведущему либо завершает игру. */
@@ -474,12 +566,104 @@ export class Room {
     }];
   }
 
-  markDisconnected(playerId: string) {
+  markDisconnected(playerId: string, since = Date.now()) {
     const player = this.players.get(playerId);
     if (!player) return;
+    this.lastActivityAt = Date.now();
+    // Повторный разрыв не должен сдвигать момент ухода (от него считается ожидание).
+    if (player.connected === false && this.reservedAt.has(playerId)) return;
     this.players.set(playerId, { ...player, connected: false });
     this.reservedPlayers.add(playerId);
-    this.reservedAt.set(playerId, Date.now());
+    this.reservedAt.set(playerId, since);
+  }
+
+  /** HTTP-опрос резервного режима: игрок жив. Возвращает true, если он снова стал онлайн. */
+  markSeen(playerId: string): boolean {
+    const player = this.players.get(playerId);
+    if (!player) return false;
+    const now = Date.now();
+    this.lastSeenAt.set(playerId, now);
+    this.lastActivityAt = now;
+    if (player.connected !== false) return false;
+    this.players.set(playerId, { ...player, connected: true });
+    this.reservedPlayers.delete(playerId);
+    this.reservedAt.delete(playerId);
+    return true;
+  }
+
+  /** Игроки без WebSocket, переставшие опрашивать сервер, помечаются офлайн (иначе они «онлайн» вечно). */
+  expireSilentPlayers(hasSocket: (playerId: string) => boolean, timeoutMs: number): boolean {
+    const now = Date.now();
+    let changed = false;
+    for (const player of Array.from(this.players.values())) {
+      if (player.connected === false || hasSocket(player.id)) continue;
+      const lastSeen = this.lastSeenAt.get(player.id) ?? 0;
+      if (now - lastSeen < timeoutMs) continue;
+      this.markDisconnected(player.id, lastSeen || now);
+      changed = true;
+    }
+    return changed;
+  }
+
+  /** С какого момента игрок офлайн: null — в сети, 0 — его уже нет в комнате. */
+  private offlineSince(playerId: string): number | null {
+    const player = this.players.get(playerId);
+    if (!player) return 0;
+    if (player.connected !== false) return null;
+    return this.reservedAt.get(playerId) ?? 0;
+  }
+
+  isPlayerAway(playerId: string, graceMs = PLAYER_AWAY_GRACE_MS): boolean {
+    const since = this.offlineSince(playerId);
+    return since !== null && Date.now() - since >= graceMs;
+  }
+
+  private getAwayPlayerIds(): string[] {
+    return this.gameState?.players.filter((player) => this.isPlayerAway(player.id)).map((player) => player.id) ?? [];
+  }
+
+  /**
+   * Пересчитывает всё, что зависит от присутствия: раунд не ждёт игроков, которые давно офлайн,
+   * а ход пропавшего ведущего переходит дальше. Возвращает true, если состояние изменилось.
+   */
+  refreshPresence(): boolean {
+    const state = this.gameState;
+    if (!state) return false;
+    const fingerprint = () => [
+      state.phase,
+      state.round,
+      state.currentLeaderIndex,
+      state.questionId,
+      state.mostFunnyAnswerId,
+      state.funnyVotesRequiredCount,
+      state.awayPlayerIds.join(','),
+    ].join('|');
+    const before = fingerprint();
+    if (state.phase === 'answering' || state.phase === 'judging') {
+      if (this.skipAwayLeaderTurn().length === 0) {
+        if (state.phase === 'answering') this.maybeStartJudging();
+        else this.updateFunnyVoteState();
+      }
+    }
+    state.awayPlayerIds = this.getAwayPlayerIds();
+    return fingerprint() !== before;
+  }
+
+  private skipAwayLeaderTurn(): GameEvent[] {
+    const state = this.gameState!;
+    const leader = state.players[state.currentLeaderIndex];
+    if (!leader || !this.isPlayerAway(leader.id, LEADER_AWAY_GRACE_MS)) return [];
+    const total = state.players.length;
+    for (let step = 1; step < total; step += 1) {
+      const candidateIndex = (state.currentLeaderIndex + step) % total;
+      if (this.isPlayerAway(state.players[candidateIndex].id)) continue;
+      state.currentLeaderIndex = candidateIndex;
+      state.round += 1;
+      this.beginRound();
+      const next = state.players[candidateIndex];
+      return [{ type: 'round_started', leaderId: next.id, leaderName: next.name, questionText: state.questionText, round: state.round }];
+    }
+    return [];
   }
 
   pruneExpiredLobbyReservations() {
@@ -539,29 +723,39 @@ export class Room {
     this.casinoForcedLosses.delete(playerId);
     this.submissions.delete(playerId);
     this.pruneJudgingAnswerByPlayer(playerId);
+    for (const reactions of Object.values(this.answerReactionPlayers)) {
+      for (const playerIds of Object.values(reactions)) playerIds?.delete(playerId);
+    }
+    state.answerReactions = this.getAnswerReactionCounts();
 
-    if (state.players.length < 3) {
+    if (state.players.length < MIN_PLAYERS) {
       // Недостаточно игроков — заканчиваем партию.
       state.phase = 'gameOver';
       state.winnerId = pickWinnerId(state.players);
+      state.awayPlayerIds = this.getAwayPlayerIds();
       this.onStateChanged?.();
       return;
     }
 
-    // Пересчитываем индекс ведущего.
-    const newLeaderIndex = Math.max(0, state.players.findIndex((p) => p.id === leaderId));
-    state.currentLeaderIndex = leaderId && newLeaderIndex >= 0 ? newLeaderIndex : state.currentLeaderIndex % state.players.length;
+    if (wasLeader) {
+      // Следующий по очереди игрок теперь стоит на месте ушедшего ведущего.
+      const nextIndex = idx % state.players.length;
+      state.currentLeaderIndex = state.phase === 'roundResults'
+        ? (nextIndex - 1 + state.players.length) % state.players.length // next_round сам прибавит 1
+        : nextIndex;
+    } else {
+      state.currentLeaderIndex = Math.max(0, state.players.findIndex((p) => p.id === leaderId));
+    }
     state.totalRounds = Math.min(state.totalRounds, state.players.length);
 
     if (wasLeader && (state.phase === 'answering' || state.phase === 'judging')) {
-      // Ведущий ушёл во время раунда — прерываем раунд и стартуем заново
-      // с тем же индексом (он теперь указывает на следующего игрока).
-      state.currentLeaderIndex = state.currentLeaderIndex % state.players.length;
+      // Ведущий ушёл во время раунда — раунд начинается заново со следующим ведущим.
       this.beginRound();
     } else if (state.phase === 'answering') {
       // Возможно, оставшиеся уже все ответили.
       this.maybeStartJudging();
     }
+    state.awayPlayerIds = this.getAwayPlayerIds();
     this.onStateChanged?.();
   }
 
@@ -594,18 +788,43 @@ export class Room {
     this.usedQuestionIds = [];
     this.casinoForcedLosses.clear();
     this.processedActionIds.clear();
+    this.lastSeenAt.clear();
+    this.funnyTieBreak = null;
   }
 
-  /** Если ответили все живые игроки — переходим к судейству. */
+  /** Если ответили все, кого стоит ждать, — переходим к судейству. */
   private maybeStartJudging() {
     const state = this.gameState!;
     if (state.phase !== 'answering') return;
-    const everyone = state.players.length;
-    if (this.submissions.size >= everyone) {
+    if (this.allRequiredAnswersIn()) {
       this.startJudging();
     } else {
       state.submittedPlayerIds = Array.from(this.submissions.keys());
     }
+  }
+
+  /** Нужен ответ ведущего и всех, кто в сети; давно отключившиеся игроки не блокируют раунд. */
+  private allRequiredAnswersIn() {
+    const state = this.gameState!;
+    const leaderId = state.players[state.currentLeaderIndex]?.id;
+    if (!leaderId || !this.submissions.has(leaderId)) return false;
+    let playerAnswers = 0;
+    for (const player of state.players) {
+      if (player.id === leaderId) continue;
+      if (this.submissions.has(player.id)) playerAnswers += 1;
+      else if (!this.isPlayerAway(player.id)) return false;
+    }
+    return playerAnswers > 0;
+  }
+
+  private rememberActionId(actionId: string): boolean {
+    if (this.processedActionIds.has(actionId)) return false;
+    this.processedActionIds.add(actionId);
+    if (this.processedActionIds.size > PROCESSED_ACTION_IDS_LIMIT) {
+      const oldest = this.processedActionIds.values().next().value;
+      if (oldest !== undefined) this.processedActionIds.delete(oldest);
+    }
+    return true;
   }
 
   processAction(playerId: string, action: PlayerAction): { state: GameState; events: GameEvent[]; privateHands: Map<string, string[]> } {
@@ -616,17 +835,15 @@ export class Room {
     const privateHands = new Map<string, string[]>();
 
     // Идемпотентность повторно присланных действий.
-    if (action.actionId) {
-      if (this.processedActionIds.has(action.actionId)) {
-        return { state, events: [], privateHands };
-      }
-      this.processedActionIds.add(action.actionId);
+    if (action.actionId && !this.rememberActionId(action.actionId)) {
+      return { state, events: [], privateHands };
     }
 
     const leader = state.players[state.currentLeaderIndex];
     const isLeader = leader?.id === playerId;
     const inGame = state.players.some((p) => p.id === playerId);
-    if (!inGame) {
+    // Действие из очереди офлайна могло прийти уже после смены раунда — "a1" нового раунда это другой ответ.
+    if (!inGame || isStaleRoundAction(action, state)) {
       return { state, events: [], privateHands };
     }
 
@@ -637,10 +854,10 @@ export class Room {
         if (state.phase !== 'answering') break;
         const text = (action.payload?.text ?? '').toString().trim();
         if (!text) break;
-        this.submissions.set(playerId, text.slice(0, 280));
+        this.submissions.set(playerId, Array.from(text).slice(0, 280).join(''));
         state.submittedPlayerIds = Array.from(this.submissions.keys());
         events.push({ type: 'answer_submitted', playerId });
-        if (this.submissions.size >= state.players.length) {
+        if (this.allRequiredAnswersIn()) {
           this.startJudging();
           events.push({ type: 'all_answers_in' });
           events.push({ type: 'phase_changed', phase: 'judging' });
@@ -765,7 +982,10 @@ export class Room {
       }
       case 'next_round': {
         if (state.phase !== 'roundResults') break;
-        if (!isLeader && this.ownerId !== playerId) break;
+        // Если и ведущий, и хост пропали, раунд может продолжить любой игрок — иначе партия зависает.
+        const leaderAndHostAway = (!leader || this.isPlayerAway(leader.id))
+          && (!this.ownerId || this.isPlayerAway(this.ownerId));
+        if (!isLeader && this.ownerId !== playerId && !leaderAndHostAway) break;
         events = events.concat(this.advanceToNextRound());
         break;
       }
@@ -773,6 +993,7 @@ export class Room {
         break;
     }
 
+    state.awayPlayerIds = this.getAwayPlayerIds();
     this.gameState = state;
     return { state: this.gameState, events, privateHands };
   }

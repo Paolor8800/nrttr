@@ -15,6 +15,7 @@
     "src/data/**/*.ts",
     "src/lib/casinoRoulette.ts",
     "src/lib/cardDeck.ts",
-    "src/lib/roomCode.ts"
+    "src/lib/roomCode.ts",
+    "src/lib/roomLimits.ts"
   ]
 }

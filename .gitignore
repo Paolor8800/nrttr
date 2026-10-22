@@ -1,0 +1,14 @@
+node_modules/
+dist/
+server-dist/
+*.local
+.env
+.env.local
+android/
+.idea/
+*.log
+node_modules
+dist
+server-dist
+tmp-ui-shots/
+.DS_Store

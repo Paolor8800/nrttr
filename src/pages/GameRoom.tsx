@@ -107,6 +107,10 @@ function useJudgingReveal(state: GameState): { visibleAnswers: AnswerView[]; rev
   const [visibleIds, setVisibleIds] = useState<string[]>([]);
   const [revealComplete, setRevealComplete] = useState(false);
   const answerKey = state.answers.map((answer) => answer.id).join('|');
+  const answerKeyRef = useRef(answerKey);
+  useEffect(() => {
+    answerKeyRef.current = answerKey;
+  }, [answerKey]);
 
   useEffect(() => {
     if (state.phase !== 'judging') {
@@ -115,7 +119,9 @@ function useJudgingReveal(state: GameState): { visibleAnswers: AnswerView[]; rev
       return;
     }
 
-    const order = answerKey ? answerKey.split('|') : [];
+    // Порядок фиксируется в начале показа: если игрок вышел и его ответ исчез,
+    // показ не начинается заново у всех и кнопки ведущего не пропадают.
+    const order = answerKeyRef.current ? answerKeyRef.current.split('|') : [];
     const step = revealStepMs(order.length);
     setVisibleIds([]);
     setRevealComplete(order.length === 0);
@@ -128,7 +134,7 @@ function useJudgingReveal(state: GameState): { visibleAnswers: AnswerView[]; rev
       }, ANSWER_LEADER_PAUSE_MS + order.length * step + ANSWER_INTERFACE_REVEAL_MS));
     }
     return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [state.phase, state.round, state.questionId, answerKey]);
+  }, [state.phase, state.round, state.questionId]);
 
   const byId = new Map(state.answers.map((answer) => [answer.id, answer]));
   const visibleAnswers = visibleIds.map((answerId) => byId.get(answerId)).filter(Boolean) as AnswerView[];
@@ -628,7 +634,10 @@ function GamePlay({ state, myId, sendAction, isHost, ownerId, connectionStatus, 
               <QuestionPanel state={state} leader={leader} />
             )}
             {showJudgingInterface && !isSpectator && <RolePrompt state={state} isLeader={isLeader} myId={myId} />}
-            {state.phase === 'answering' && !isSpectator && <Answering state={state} myId={myId} isLeader={isLeader} send={send} />}
+            {state.phase === 'answering' && !isSpectator && (
+              // key сбрасывает черновик, если вопрос сменился (ход пропавшего ведущего перешёл дальше).
+              <Answering key={`${state.round}:${state.questionId}`} state={state} myId={myId} isLeader={isLeader} send={send} />
+            )}
             {state.phase === 'judging' && <Judging state={state} isLeader={isLeader} canVote={!isSpectator} send={send} visibleAnswers={visibleAnswers} revealComplete={revealComplete} />}
             {state.phase === 'roundResults' && <RoundResults state={state} isLeader={isLeader} isHost={isHost} ownerId={ownerId} canAct={!isSpectator} send={send} />}
             {state.phase === 'gameOver' && <GameOver state={state} isHost={isHost} onPlayAgain={onPlayAgain} onLeave={onLeave} />}

@@ -857,11 +857,14 @@ export function useGameRoom(
       ...action,
       actionId: crypto.randomUUID(),
     };
+    // Ставку в казино не повторяем позже: игрок уже увидел «ставка не прошла»,
+    // а отложенная отправка после переподключения списала бы очки ещё раз.
+    const retryable = action.type !== 'casino_spin';
     const sentOverWebSocket = connectionModeRef.current === 'websocket'
       && socketRef.current?.readyState === WebSocket.OPEN
       && protocolConnectedRef.current;
 
-    if (sentOverWebSocket) {
+    if (sentOverWebSocket && retryable) {
       pendingActionAcksRef.current.set(actionWithId.actionId!, actionWithId);
       updatePendingActionsCount();
     }
@@ -872,10 +875,12 @@ export function useGameRoom(
     });
 
     if (!ok) {
-      if (sentOverWebSocket) {
+      if (sentOverWebSocket && retryable) {
         pendingActionAcksRef.current.delete(actionWithId.actionId!);
       }
-      if (
+      if (!retryable) {
+        toast.error('Ставка не прошла — проверь связь и попробуй ещё раз');
+      } else if (
         connectionModeRef.current === 'websocket' &&
         (socketRef.current?.readyState !== WebSocket.OPEN || !protocolConnectedRef.current)
       ) {

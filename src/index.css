@@ -319,14 +319,13 @@
     to { filter: brightness(1); }
   }
 
+  /* Только opacity: прежний scale(1.14) на слое с inset: -24% раздувал прокрутку окна и засвечивал текст. */
   @keyframes casino-win-pulse {
     0%, 100% {
-      opacity: 0.48;
-      transform: scale(0.9);
+      opacity: 0.4;
     }
     45% {
-      opacity: 1;
-      transform: scale(1.14);
+      opacity: 0.85;
     }
   }
 
@@ -381,7 +380,8 @@
   }
 
   .casino-dialog {
-    max-width: calc(100vw - 1rem);
+    /* Этот слой идёт после утилит Tailwind и перебивал max-w-[760px]: на десктопе окно растягивалось на весь экран. */
+    max-width: min(760px, calc(100vw - 1rem));
     max-height: calc(100dvh - max(1.2rem, env(safe-area-inset-top)) - env(safe-area-inset-bottom));
     overflow-x: hidden;
     border-color: rgb(252 211 77 / 0.46);
@@ -421,13 +421,14 @@
   .casino-dialog-win::after {
     content: '';
     position: absolute;
-    inset: -24%;
+    inset: 0;
+    border-radius: inherit;
     pointer-events: none;
     background:
-      radial-gradient(circle at 50% 34%, rgb(255 247 173 / 0.7), transparent 26%),
-      radial-gradient(circle at 24% 64%, rgb(52 211 153 / 0.34), transparent 34%),
-      radial-gradient(circle at 76% 58%, rgb(244 114 182 / 0.32), transparent 32%),
-      radial-gradient(circle, rgb(251 191 36 / 0.46), transparent 62%);
+      radial-gradient(circle at 50% 30%, rgb(255 247 173 / 0.38), transparent 30%),
+      radial-gradient(circle at 22% 62%, rgb(52 211 153 / 0.2), transparent 36%),
+      radial-gradient(circle at 78% 58%, rgb(244 114 182 / 0.18), transparent 34%),
+      radial-gradient(circle at 50% 40%, rgb(251 191 36 / 0.22), transparent 64%);
     animation: casino-win-pulse 0.82s ease-in-out infinite;
   }
 
@@ -515,10 +516,13 @@
     animation-delay: 0.42s;
   }
 
+  /* Радиус и размер номеров считаются от размера колеса: раньше на ширине 640–774px номера уезжали за край. */
   .casino-wheel-wrap {
-    --casino-pocket-radius: clamp(6.15rem, 33vw, 8.9rem);
+    --casino-wheel-size: clamp(16rem, 82vw, 21.6rem);
+    --casino-pocket-radius: calc(var(--casino-wheel-size) * 0.385);
+    --casino-pocket-size: calc(var(--casino-wheel-size) * 0.058);
     position: relative;
-    width: clamp(16rem, 82vw, 21.6rem);
+    width: var(--casino-wheel-size);
     max-width: 100%;
     aspect-ratio: 1;
     border-radius: 999px;
@@ -541,7 +545,7 @@
     top: -0.16rem;
     z-index: 12;
     width: 1.28rem;
-    height: 1.85rem;
+    height: 1.7rem;
     transform: translateX(-50%);
     clip-path: polygon(50% 100%, 8% 0, 92% 0);
     background: linear-gradient(180deg, #fff8c9, #facc15 48%, #b45309);
@@ -616,15 +620,15 @@
     left: 50%;
     top: 50%;
     z-index: 4;
-    width: clamp(1rem, 4vw, 1.36rem);
-    height: clamp(1rem, 4vw, 1.36rem);
+    width: var(--casino-pocket-size);
+    height: var(--casino-pocket-size);
     transform-origin: center;
     display: flex;
     align-items: center;
     justify-content: center;
     border-radius: 999px;
     border: 1px solid rgb(255 255 255 / 0.12);
-    font-size: clamp(0.46rem, 1.78vw, 0.68rem);
+    font-size: calc(var(--casino-pocket-size) * 0.5);
     font-weight: 900;
     line-height: 1;
     text-shadow: 0 1px 2px rgb(0 0 0 / 0.9);
@@ -638,9 +642,10 @@
     top: 50%;
     z-index: 3;
     width: 1px;
-    height: 42%;
+    height: 48%;
     transform-origin: 50% 0;
-    background: linear-gradient(180deg, rgb(255 235 166 / 0.62), transparent 72%);
+    /* Линия видна только на полосе с номерами, внутренняя часть закрыта кольцом. */
+    background: linear-gradient(180deg, transparent 0 66%, rgb(255 235 166 / 0.5) 72%, rgb(255 235 166 / 0.18) 100%);
     pointer-events: none;
   }
 
@@ -961,6 +966,8 @@
 
   .casino-number-picker select {
     appearance: none;
+    /* Safari игнорирует text-align у select. */
+    text-align-last: center;
   }
 
   .casino-spin-button {
@@ -1001,14 +1008,13 @@
     }
 
     .casino-wheel-wrap {
-      --casino-pocket-radius: min(25.5vw, 8.9rem);
-      width: min(43vw, 21.6rem);
+      --casino-wheel-size: 21.6rem;
     }
 
     .casino-pointer {
       top: -0.18rem;
       width: 1.42rem;
-      height: 2.05rem;
+      height: 1.9rem;
     }
 
     .casino-result-panel {
@@ -1097,6 +1103,34 @@
 
     .casino-spin-button-table {
       min-height: 3.65rem;
+    }
+  }
+
+  @media (min-width: 768px) {
+    .casino-wheel-wrap {
+      --casino-wheel-size: min(43vw, 21.6rem);
+    }
+  }
+
+  /* Телефон в альбомной ориентации: шапка не липнет и колесо помещается по высоте. */
+  @media (max-height: 560px) {
+    .casino-dialog-header {
+      position: relative;
+      padding-bottom: 0.2rem;
+    }
+
+    .casino-dialog-header h2 {
+      margin-top: 0.3rem;
+      font-size: 1.35rem;
+    }
+
+    .casino-dialog .casino-dialog-body {
+      align-items: start;
+      margin-top: 0.4rem;
+    }
+
+    .casino-wheel-wrap {
+      --casino-wheel-size: max(13rem, min(21.6rem, 43vw, calc(100dvh - 9rem)));
     }
   }
 

@@ -3,6 +3,7 @@ import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Users, Plus, LogIn, RefreshCw, QrCode } from 'lucide-react';
 import { isValidRoomCode } from '@/lib/roomCode';
 import { loadGameSession, clearGameSession } from '@/lib/gameCookies';
+import { MAX_PLAYERS, MIN_PLAYERS } from '@/lib/roomLimits';
 
 export default function Index() {
   const navigate = useNavigate();
@@ -70,6 +71,7 @@ export default function Index() {
       host: savedSession.isHost.toString(),
       name: savedSession.playerName,
       room: savedSession.roomCode,
+      gender: savedSession.gender ?? gender,
     });
     
     navigate(`/game?${params.toString()}`);
@@ -95,7 +97,7 @@ export default function Index() {
           <h1 className="text-3xl sm:text-4xl font-display font-black text-foreground leading-tight text-balance">
             <span className="text-primary">УЗНАЙ</span><br />ДРУЗЕЙ
           </h1>
-          <p className="text-muted-foreground text-sm mt-2">Весёлая игра для 3–10 друзей</p>
+          <p className="text-muted-foreground text-sm mt-2">Весёлая игра для {MIN_PLAYERS}–{MAX_PLAYERS} друзей</p>
           <div className="mt-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/55">beta версия</div>
         </div>
 

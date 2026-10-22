@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties, MouseEvent, PointerEvent, ReactNode } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { useGameRoom } from '@/hooks/useGameRoom';
@@ -12,8 +12,9 @@ import {
   type RouletteColor,
 } from '@/lib/casinoRoulette';
 import { createRoomJoinUrl, isMobileReachabilityWarningUrl } from '@/lib/joinLink';
+import { MAX_PLAYERS, MIN_PLAYERS } from '@/lib/roomLimits';
 import { toast } from 'sonner';
-import type { AnswerView, CasinoBetType, CasinoSpinResult, GameState, Player, ReactionType } from '@/types/game';
+import type { AnswerView, CasinoBetType, CasinoSpinResult, GameState, Gender, Player, ReactionType } from '@/types/game';
 import { HOST_ANSWER_REACTION_ID } from '@/types/game';
 import QRCode from 'qrcode';
 import { AlertTriangle, ArrowRight, Brain, CheckCircle2, Copy, Crown, Dice5, DoorOpen, Laugh, Link as LinkIcon, QrCode, RefreshCw, Send, Smartphone, Sparkles, Trophy, Wifi, WifiOff, X } from 'lucide-react';
@@ -28,9 +29,14 @@ const ANSWER_REACTIONS: Array<{ type: ReactionType; emoji: string; label: string
 const ANSWER_TONE_CLASSES = ['answer-card--ruby', 'answer-card--teal', 'answer-card--gold', 'answer-card--violet', 'answer-card--blue'];
 const ANSWER_LEADER_PAUSE_MS = 2000;
 const ANSWER_REVEAL_STEP_MS = 1200;
+const ANSWER_REVEAL_MIN_STEP_MS = 500;
+/** Общая длительность показа ответов; при 14 ответах шаг 1,2 с давал ~19 с ожидания. */
+const ANSWER_REVEAL_TOTAL_MS = 7200;
 const ANSWER_INTERFACE_REVEAL_MS = 420;
 const ANSWER_REACTION_LONG_PRESS_MS = 520;
 const CASINO_SPIN_MS = 7600;
+const CASINO_PENDING_TIMEOUT_MS = 12000;
+const CASINO_AUTO_CLOSE_AFTER_REVEAL_MS = 2500;
 const ROULETTE_POCKET_GAP_DEGREES = 0.34;
 const ROULETTE_SEGMENT_COLORS: Record<RouletteColor, string> = {
   green: '#087a4d',
@@ -61,6 +67,27 @@ const CASINO_FIREWORKS = Array.from({ length: 42 }, (_, index) => ({
   delay: (index % 9) * 34,
 }));
 
+function revealStepMs(answerCount: number): number {
+  return Math.max(ANSWER_REVEAL_MIN_STEP_MS, Math.min(ANSWER_REVEAL_STEP_MS, Math.round(ANSWER_REVEAL_TOTAL_MS / Math.max(1, answerCount))));
+}
+
+function pluralizePoints(value: number): string {
+  const abs = Math.abs(value) % 100;
+  const last = abs % 10;
+  if (abs > 10 && abs < 20) return 'очков';
+  if (last === 1) return 'очко';
+  if (last >= 2 && last <= 4) return 'очка';
+  return 'очков';
+}
+
+function getStoredGender(): Gender {
+  try {
+    return localStorage.getItem('player_gender') === 'female' ? 'female' : 'male';
+  } catch {
+    return 'male';
+  }
+}
+
 function toneForAnswer(answerId: string): string {
   let hash = 0;
   for (let index = 0; index < answerId.length; index += 1) {
@@ -89,15 +116,16 @@ function useJudgingReveal(state: GameState): { visibleAnswers: AnswerView[]; rev
     }
 
     const order = answerKey ? answerKey.split('|') : [];
+    const step = revealStepMs(order.length);
     setVisibleIds([]);
     setRevealComplete(order.length === 0);
     const timers = order.map((answerId, index) => window.setTimeout(() => {
       setVisibleIds((current) => current.includes(answerId) ? current : [...current, answerId]);
-    }, ANSWER_LEADER_PAUSE_MS + index * ANSWER_REVEAL_STEP_MS));
+    }, ANSWER_LEADER_PAUSE_MS + index * step));
     if (order.length > 0) {
       timers.push(window.setTimeout(() => {
         setRevealComplete(true);
-      }, ANSWER_LEADER_PAUSE_MS + order.length * ANSWER_REVEAL_STEP_MS + ANSWER_INTERFACE_REVEAL_MS));
+      }, ANSWER_LEADER_PAUSE_MS + order.length * step + ANSWER_INTERFACE_REVEAL_MS));
     }
     return () => timers.forEach((timer) => window.clearTimeout(timer));
   }, [state.phase, state.round, state.questionId, answerKey]);
@@ -117,13 +145,19 @@ export default function GameRoom() {
   const hostParam = params.get('host');
   const isHost = hostParam === null ? (savedSession?.isHost ?? false) : hostParam === 'true';
   const playerName = params.get('name') || savedSession?.playerName || 'Игрок';
-  const playerGender = params.get('gender') === 'female' ? 'female' : 'male';
+  const genderParam = params.get('gender');
+  // При восстановлении сессии gender в URL нет — раньше девушки после этого становились «мужчинами».
+  const playerGender: Gender = genderParam === 'female' || genderParam === 'male'
+    ? genderParam
+    : savedSession?.gender ?? getStoredGender();
   const roomParam = params.get('room') || savedSession?.roomCode || null;
   const shouldUseSavedSession = Boolean(savedSession && savedSession.playerName === playerName && savedSession.isHost === isHost && savedSession.roomCode === roomParam);
 
   const {
     gameState,
     myId,
+    isHost: isRoomHost,
+    ownerId,
     roomCode,
     connected,
     connectionStatus,
@@ -167,7 +201,7 @@ export default function GameRoom() {
       await copyText(joinUrl);
       toast.success('Ссылка скопирована');
     };
-    const canStart = isHost && lobbyPlayers.length >= 3;
+    const canStart = isRoomHost && lobbyPlayers.length >= MIN_PLAYERS;
     return (
       <Center>
         <div className='w-full max-w-5xl space-y-6 py-6'>
@@ -182,15 +216,15 @@ export default function GameRoom() {
                 <LinkIcon className='h-4 w-4' />
                 Поделиться ссылкой
               </button>
-              {isHost && (
+              {isRoomHost && (
                 <button onClick={() => setQrOpen(true)} className='btn-secondary flex w-full items-center justify-center gap-2 border border-primary/30 bg-primary/10 text-primary hover:bg-primary/15'>
                   <QrCode className='h-4 w-4' />
                   Подключиться по QR
                 </button>
               )}
-              {isHost ? (
+              {isRoomHost ? (
                 <button disabled={!canStart} onClick={() => startGame()} className='btn-primary w-full disabled:opacity-50'>
-                  {canStart ? 'Начать игру' : 'Нужно минимум 3 игрока'}
+                  {canStart ? 'Начать игру' : `Нужно минимум ${MIN_PLAYERS} игрока`}
                 </button>
               ) : (
                 <div className='text-center text-muted-foreground text-sm'>Ждём, пока хост начнёт игру…</div>
@@ -203,7 +237,7 @@ export default function GameRoom() {
             <div className='card p-5 space-y-3'>
               <div className='flex items-center justify-between gap-3'>
                 <div className='text-sm text-muted-foreground'>Игроки</div>
-                <div className='badge bg-primary/15 text-primary'>{lobbyPlayers.length}/10</div>
+                <div className='badge bg-primary/15 text-primary'>{lobbyPlayers.length}/{MAX_PLAYERS}</div>
               </div>
               <div className='grid gap-2 sm:grid-cols-2'>
                 {lobbyPlayers.map((pl) => (
@@ -214,7 +248,7 @@ export default function GameRoom() {
                       {pl.isHost && <span className='ml-2 text-xs text-primary'>хост</span>}
                       {(pl as { connected?: boolean }).connected === false && <span className='ml-2 text-xs text-muted-foreground'>не в сети</span>}
                     </span>
-                    {isHost && pl.id !== myId && (
+                    {isRoomHost && pl.id !== myId && (
                       <button onClick={() => kickPlayer(pl.id)} className='shrink-0 text-xs text-destructive'>убрать</button>
                     )}
                   </div>
@@ -223,7 +257,7 @@ export default function GameRoom() {
             </div>
           </div>
         </div>
-        {isHost && (
+        {isRoomHost && (
           <QrJoinDialog
             open={qrOpen}
             onClose={() => setQrOpen(false)}
@@ -236,7 +270,7 @@ export default function GameRoom() {
           open={leaveConfirmOpen}
           onClose={() => setLeaveConfirmOpen(false)}
           onConfirm={confirmLeave}
-          isHost={isHost}
+          isHost={isRoomHost}
         />
       </Center>
     );
@@ -248,7 +282,8 @@ export default function GameRoom() {
         state={gameState}
         myId={myId}
         sendAction={sendAction}
-        isHost={isHost}
+        isHost={isRoomHost}
+        ownerId={ownerId}
         connectionStatus={connectionStatus}
         connectionMode={connectionMode}
         connectionError={connectionError}
@@ -262,7 +297,7 @@ export default function GameRoom() {
         open={leaveConfirmOpen}
         onClose={() => setLeaveConfirmOpen(false)}
         onConfirm={confirmLeave}
-        isHost={isHost}
+        isHost={isRoomHost}
       />
     </>
   );
@@ -516,9 +551,9 @@ function RolePrompt({ state, isLeader, myId }: { state: GameState; isLeader: boo
   );
 }
 
-function GamePlay({ state, myId, sendAction, isHost, connectionStatus, connectionMode, connectionError, syncPending, pendingActionsCount, onSync, onLeave, onPlayAgain }: {
-  state: GameState; myId: string | null; isHost: boolean;
-  sendAction: (a: { type: string; payload?: unknown }) => Promise<boolean> | void;
+function GamePlay({ state, myId, sendAction, isHost, ownerId, connectionStatus, connectionMode, connectionError, syncPending, pendingActionsCount, onSync, onLeave, onPlayAgain }: {
+  state: GameState; myId: string | null; isHost: boolean; ownerId: string | null;
+  sendAction: (a: { type: string; payload?: unknown; round?: number; questionId?: string | null }) => Promise<boolean> | void;
   connectionStatus: string;
   connectionMode: string;
   connectionError: string | null;
@@ -530,15 +565,25 @@ function GamePlay({ state, myId, sendAction, isHost, connectionStatus, connectio
   const leader = state.players[state.currentLeaderIndex];
   const isLeader = leader?.id === myId;
   const myPlayer = state.players.find((player) => player.id === myId);
+  // Вошёл после старта партии: сервер игнорирует его действия, поэтому вместо формы — пояснение.
+  const isSpectator = Boolean(myId) && !myPlayer;
   const [casinoOpen, setCasinoOpen] = useState(false);
-  const send = (type: string, payload?: unknown) => sendAction({ type, payload } as never);
+  const [casinoCloseRequested, setCasinoCloseRequested] = useState(false);
+  // round/questionId помогают серверу отбросить действие, если оно дошло уже в следующем раунде.
+  const send = (type: string, payload?: unknown) => sendAction({ type, payload, round: state.round, questionId: state.questionId } as never);
   const circle = Math.floor(state.round / Math.max(1, state.players.length)) + 1;
   const { visibleAnswers, revealComplete } = useJudgingReveal(state);
   const showJudgingInterface = state.phase !== 'judging' || revealComplete;
   const casinoAvailable = Boolean(myPlayer && myPlayer.score >= 1 && state.phase !== 'gameOver');
+  const closeCasino = useCallback(() => setCasinoOpen(false), []);
+  const openCasino = () => {
+    setCasinoCloseRequested(false);
+    setCasinoOpen(true);
+  };
 
   useEffect(() => {
-    setCasinoOpen(false);
+    // Смена фазы закрывает казино, но крутящееся колесо сначала доигрывает результат.
+    setCasinoCloseRequested(true);
   }, [state.phase, state.round, state.currentLeaderIndex, state.questionId]);
 
   return (
@@ -562,7 +607,7 @@ function GamePlay({ state, myId, sendAction, isHost, connectionStatus, connectio
             {casinoAvailable && (
               <button
                 type='button'
-                onClick={() => setCasinoOpen(true)}
+                onClick={openCasino}
                 className='casino-top-button inline-flex h-9 w-9 items-center justify-center rounded-lg p-0 sm:h-10 sm:w-10 sm:rounded-xl'
                 aria-label='Казино'
                 title='Казино'
@@ -578,30 +623,45 @@ function GamePlay({ state, myId, sendAction, isHost, connectionStatus, connectio
         </div>
         <div className='grid gap-4'>
           <main className='min-w-0 space-y-4'>
+            {isSpectator && state.phase !== 'gameOver' && <SpectatorNotice />}
             {(state.phase === 'answering' || (state.phase === 'judging' && showJudgingInterface)) && (
               <QuestionPanel state={state} leader={leader} />
             )}
-            {showJudgingInterface && <RolePrompt state={state} isLeader={isLeader} myId={myId} />}
-            {state.phase === 'answering' && <Answering state={state} myId={myId} isLeader={isLeader} send={send} />}
-            {state.phase === 'judging' && <Judging state={state} isLeader={isLeader} send={send} visibleAnswers={visibleAnswers} revealComplete={revealComplete} />}
-            {state.phase === 'roundResults' && <RoundResults state={state} isLeader={isLeader} isHost={isHost} send={send} />}
+            {showJudgingInterface && !isSpectator && <RolePrompt state={state} isLeader={isLeader} myId={myId} />}
+            {state.phase === 'answering' && !isSpectator && <Answering state={state} myId={myId} isLeader={isLeader} send={send} />}
+            {state.phase === 'judging' && <Judging state={state} isLeader={isLeader} canVote={!isSpectator} send={send} visibleAnswers={visibleAnswers} revealComplete={revealComplete} />}
+            {state.phase === 'roundResults' && <RoundResults state={state} isLeader={isLeader} isHost={isHost} ownerId={ownerId} canAct={!isSpectator} send={send} />}
             {state.phase === 'gameOver' && <GameOver state={state} isHost={isHost} onPlayAgain={onPlayAgain} onLeave={onLeave} />}
           </main>
         </div>
       </div>
       <CasinoRouletteDialog
         open={casinoOpen}
+        closeRequested={casinoCloseRequested}
         state={state}
         myId={myId}
         send={send}
-        onClose={() => setCasinoOpen(false)}
+        onClose={closeCasino}
       />
     </Center>
   );
 }
 
-function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
+function SpectatorNotice() {
+  return (
+    <section className='rounded-lg border border-sky-400/35 bg-sky-400/10 px-4 py-3'>
+      <div className='text-xs font-bold uppercase tracking-[0.14em] text-sky-300'>Ты в комнате</div>
+      <div className='mt-1 text-lg font-black leading-tight text-foreground'>Партия началась без тебя</div>
+      <div className='mt-1 text-sm leading-relaxed text-muted-foreground'>
+        Можно смотреть за раундами, а играть — со следующей партии: хост начнёт её после финала.
+      </div>
+    </section>
+  );
+}
+
+function CasinoRouletteDialog({ open, closeRequested, state, myId, send, onClose }: {
   open: boolean;
+  closeRequested: boolean;
   state: GameState;
   myId: string | null;
   send: (t: string, p?: unknown) => Promise<boolean> | void;
@@ -700,6 +760,24 @@ function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
     if (revealTimerRef.current) window.clearTimeout(revealTimerRef.current);
   }, []);
 
+  useEffect(() => {
+    if (!open || !pending) return;
+    // Сервер мог проигнорировать ставку (очки кончились, игра закончилась) — не оставляем колесо «крутиться» вечно.
+    const timer = window.setTimeout(() => {
+      setPending(false);
+      setSpinState('idle');
+      resolvedSpinRef.current = null;
+      toast.error('Ставка не прошла. Попробуй ещё раз.');
+    }, CASINO_PENDING_TIMEOUT_MS);
+    return () => window.clearTimeout(timer);
+  }, [open, pending]);
+
+  useEffect(() => {
+    if (!open || !closeRequested || pending || spinState === 'spinning') return;
+    const timer = window.setTimeout(onClose, spinState === 'revealed' ? CASINO_AUTO_CLOSE_AFTER_REVEAL_MS : 0);
+    return () => window.clearTimeout(timer);
+  }, [open, closeRequested, pending, spinState, onClose]);
+
   if (!open) return null;
 
   const resultColor = shownSpin ? rouletteColorForNumber(shownSpin.resultNumber) : null;
@@ -784,7 +862,7 @@ function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
           </button>
         </div>
 
-        <div className='relative z-10 mt-3 grid gap-3 md:grid-cols-[minmax(0,1.04fr)_minmax(17.5rem,0.96fr)] md:items-center'>
+        <div className='casino-dialog-body relative z-10 mt-3 grid gap-3 md:grid-cols-[minmax(0,1.04fr)_minmax(17.5rem,0.96fr)] md:items-center'>
           <div className='casino-wheel-wrap mx-auto' aria-label='Колесо рулетки'>
             <div className='casino-pointer' aria-hidden='true' />
             <div
@@ -802,14 +880,14 @@ function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
                   <span
                     key={`${number}-divider`}
                     className='casino-pocket-divider'
-                    style={{ transform: `translateX(-50%) rotate(${index * ROULETTE_POCKET_DEGREES}deg)` }}
+                    style={{ transform: `translateX(-50%) rotate(${index * ROULETTE_POCKET_DEGREES + 180}deg)` }}
                     aria-hidden='true'
                   />,
                   <span
                     key={number}
                     className={`casino-pocket-label casino-pocket-${pocketColor}`}
                     style={{
-                      transform: `translate(-50%, -50%) rotate(${pocketAngle}deg) translateY(calc(-1 * var(--casino-pocket-radius))) rotate(-${pocketAngle}deg)`,
+                      transform: `translate(-50%, -50%) rotate(${pocketAngle}deg) translateY(calc(-1 * var(--casino-pocket-radius)))`,
                     }}
                   >
                     {number}
@@ -844,8 +922,8 @@ function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
                 </div>
               </div>
               {shownSpin && spinState === 'revealed' && (
-                <div className={'mt-2 rounded-lg px-3 py-2 text-center text-sm font-black ' + (shownSpin.won ? 'bg-emerald-400/15 text-emerald-200' : 'bg-red-500/15 text-red-100')}>
-                  {shownSpin.won ? `Победа! ${shownSpin.scoreDelta > 0 ? '+' : ''}${shownSpin.scoreDelta} очка` : '-1 очко'}
+                <div className={'mt-2 rounded-lg px-3 py-2 text-center text-sm font-black ring-1 ' + (shownSpin.won ? 'bg-emerald-950/70 text-emerald-200 ring-emerald-300/40' : 'bg-red-950/60 text-red-100 ring-red-300/25')}>
+                  {shownSpin.won ? `Победа! +${shownSpin.scoreDelta} ${pluralizePoints(shownSpin.scoreDelta)}` : '−1 очко'}
                 </div>
               )}
             </div>
@@ -891,6 +969,23 @@ function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
                 <strong>+4</strong>
               </button>
 
+              {betType === 'number' && (
+                <div className='casino-number-picker'>
+                  <button type='button' onClick={() => changeNumber(-1)} disabled={pending || spinState === 'spinning'} aria-label='Предыдущее число'>−</button>
+                  <select
+                    value={betNumber}
+                    disabled={pending || spinState === 'spinning'}
+                    onChange={(event) => setBetNumber(Number(event.target.value))}
+                    aria-label='Число ставки'
+                  >
+                    {numberOptions.map((number) => (
+                      <option key={number} value={number}>{number}</option>
+                    ))}
+                  </select>
+                  <button type='button' onClick={() => changeNumber(1)} disabled={pending || spinState === 'spinning'} aria-label='Следующее число'>+</button>
+                </div>
+              )}
+
               <button
                 type='button'
                 disabled={pending || spinState === 'spinning'}
@@ -902,23 +997,6 @@ function CasinoRouletteDialog({ open, state, myId, send, onClose }: {
                 <strong>+6</strong>
               </button>
             </div>
-
-            {betType === 'number' && (
-              <div className='casino-number-picker'>
-                <button type='button' onClick={() => changeNumber(-1)} disabled={pending || spinState === 'spinning'} aria-label='Предыдущее число'>−</button>
-                <select
-                  value={betNumber}
-                  disabled={pending || spinState === 'spinning'}
-                  onChange={(event) => setBetNumber(Number(event.target.value))}
-                  aria-label='Число ставки'
-                >
-                  {numberOptions.map((number) => (
-                    <option key={number} value={number}>{number}</option>
-                  ))}
-                </select>
-                <button type='button' onClick={() => changeNumber(1)} disabled={pending || spinState === 'spinning'} aria-label='Следующее число'>+</button>
-              </div>
-            )}
 
             {!player || player.score < 1 ? (
               <div className='rounded-lg border border-red-400/25 bg-red-500/10 px-3 py-2 text-center text-xs font-semibold text-red-100'>
@@ -960,12 +1038,16 @@ function Answering({ state, myId, isLeader, send }: { state: GameState; myId: st
   const submitted = !!myId && state.submittedPlayerIds.includes(myId);
   const total = state.players.length;
   const done = state.submittedPlayerIds.length;
+  const away = new Set(state.awayPlayerIds ?? []);
+  const leaderId = state.players[state.currentLeaderIndex]?.id;
+  const notAwaited = state.players.filter((pl) => pl.id !== leaderId && away.has(pl.id) && !state.submittedPlayerIds.includes(pl.id)).length;
+  const awayNote = notAwaited > 0 ? ` · ${notAwaited} не в сети — их не ждём` : '';
   if (submitted) {
     return (
       <div className='card border-emerald-500/45 bg-emerald-500/10 p-6 text-center space-y-3'>
         <div className='mx-auto flex h-12 w-12 items-center justify-center rounded-lg border border-emerald-500/40 bg-emerald-500/15 text-2xl text-emerald-300'>✓</div>
         <div className='text-xl font-display font-bold'>Ответ принят</div>
-        <div className='text-sm text-muted-foreground'>Ждём остальных: {done}/{total}. Твой текст уже в игре.</div>
+        <div className='text-sm text-muted-foreground'>Ждём остальных: {done}/{total}{awayNote}. Твой текст уже в игре.</div>
       </div>
     );
   }
@@ -976,7 +1058,7 @@ function Answering({ state, myId, isLeader, send }: { state: GameState; myId: st
           <div className='text-xs uppercase tracking-[0.16em] text-muted-foreground'>{isLeader ? 'Правильный ответ' : 'Твоя версия'}</div>
           <div className='mt-1 text-xl font-display font-bold'>{isLeader ? 'Напиши ответ про себя' : 'Попробуй ответить как ведущий'}</div>
         </div>
-        <div className='text-xs text-muted-foreground'>Ответили: {done}/{total}</div>
+        <div className='text-xs text-muted-foreground'>Ответили: {done}/{total}{awayNote}</div>
       </div>
       <textarea
         value={text}
@@ -996,23 +1078,28 @@ function Answering({ state, myId, isLeader, send }: { state: GameState; myId: st
   );
 }
 
-function Judging({ state, isLeader, send, visibleAnswers, revealComplete }: {
+function Judging({ state, isLeader, canVote, send, visibleAnswers, revealComplete }: {
   state: GameState;
   isLeader: boolean;
+  canVote: boolean;
   send: (t: string, p?: unknown) => void;
   visibleAnswers: AnswerView[];
   revealComplete: boolean;
 }) {
-  const leaderId = state.players[state.currentLeaderIndex].id;
-  const others = state.players.filter((pl) => pl.id !== leaderId);
+  const leaderId = state.players[state.currentLeaderIndex]?.id;
+  const submittedIds = new Set(state.submittedPlayerIds ?? []);
+  // Кандидаты в авторы — только те, кто действительно прислал ответ (офлайн-игроки могли пропустить раунд).
+  const others = state.players.filter((pl) => pl.id !== leaderId && (submittedIds.size === 0 || submittedIds.has(pl.id)));
+  const awayCount = (state.awayPlayerIds ?? []).filter((id) => id !== leaderId).length;
   const [pendingVoteAnswerId, setPendingVoteAnswerId] = useState<string | null>(null);
   const canGuessAuthors = !!state.mostCorrectAnswerId;
   const guessedCount = state.answers.filter((answer) => Boolean(state.authorGuesses[answer.id])).length;
   const uniqueGuesses = new Set(Object.values(state.authorGuesses).filter(Boolean));
   const guessesComplete = state.answers.length > 0 && guessedCount === state.answers.length && uniqueGuesses.size === state.answers.length;
-  const votesDone = state.funnyVotesSubmittedCount;
-  const votesTotal = state.answers.length;
-  const votesComplete = votesTotal > 0 && votesDone >= votesTotal && !!state.mostFunnyAnswerId;
+  const votesRequired = state.funnyVotesRequiredCount ?? Math.max(0, state.players.length - 1);
+  const votesDone = Math.min(state.funnyVotesSubmittedCount, votesRequired);
+  // Сервер выбирает «самый смешной» только когда проголосовали все, кого ждут (раньше клиент сравнивал с числом ответов).
+  const votesComplete = Boolean(state.mostFunnyAnswerId);
   const readyToFinish = !!state.mostCorrectAnswerId && votesComplete && guessesComplete;
 
   useEffect(() => {
@@ -1020,7 +1107,7 @@ function Judging({ state, isLeader, send, visibleAnswers, revealComplete }: {
   }, [state.myFunnyVoteId, state.round]);
 
   const handleVoteTap = (answerId: string) => {
-    if (isLeader) return;
+    if (isLeader || !canVote) return;
     if (pendingVoteAnswerId === answerId) {
       send('vote_funniest', { answerId });
       setPendingVoteAnswerId(null);
@@ -1046,6 +1133,7 @@ function Judging({ state, isLeader, send, visibleAnswers, revealComplete }: {
               isCorrect={isCorrect}
               isFunny={isFunny}
               isPendingVote={pendingVoteAnswerId === a.id}
+              canVote={canVote}
               canGuessAuthors={canGuessAuthors}
               revealComplete={revealComplete}
               guessedPlayerId={guessedPlayerId}
@@ -1056,6 +1144,13 @@ function Judging({ state, isLeader, send, visibleAnswers, revealComplete }: {
           );
         })}
       </div>
+      {revealComplete && (
+        <div className='flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg border border-border bg-background/35 px-3 py-2 text-xs text-muted-foreground' aria-live='polite'>
+          <span>Голоса за смешной: <b className='tabular-nums text-foreground'>{votesDone}/{votesRequired}</b>{votesComplete ? ' ✓' : ''}</span>
+          {isLeader && <span>Авторы: <b className='tabular-nums text-foreground'>{guessedCount}/{state.answers.length}</b></span>}
+          {awayCount > 0 && <span>{awayCount} не в сети — их не ждём</span>}
+        </div>
+      )}
       {isLeader && revealComplete && (
         <div className='cinematic-panel sticky bottom-3 z-20 rounded-xl border border-border bg-card/95 p-3 shadow-2xl backdrop-blur sm:static sm:border-0 sm:bg-transparent sm:p-0 sm:shadow-none'>
         <button disabled={!readyToFinish} onClick={() => send('finish_judging')} className='btn-primary w-full disabled:opacity-50'>
@@ -1063,7 +1158,7 @@ function Judging({ state, isLeader, send, visibleAnswers, revealComplete }: {
         </button>
         </div>
       )}
-      {!isLeader && revealComplete && pendingVoteAnswerId && !state.myFunnyVoteId && (
+      {!isLeader && canVote && revealComplete && pendingVoteAnswerId && !state.myFunnyVoteId && (
         <div className='cinematic-panel sticky bottom-3 z-20 rounded-xl border border-border bg-card/95 p-3 shadow-2xl backdrop-blur sm:hidden'>
           <button onClick={() => handleVoteTap(pendingVoteAnswerId)} className='btn-primary w-full'>Подтвердить смешной ответ</button>
         </div>
@@ -1175,13 +1270,14 @@ function HostAnswerCard({ state, send }: {
   );
 }
 
-function JudgingAnswerCard({ answer, state, isLeader, isCorrect, isFunny, isPendingVote, canGuessAuthors, revealComplete, guessedPlayerId, others, send, onVoteTap }: {
+function JudgingAnswerCard({ answer, state, isLeader, isCorrect, isFunny, isPendingVote, canVote, canGuessAuthors, revealComplete, guessedPlayerId, others, send, onVoteTap }: {
   answer: AnswerView;
   state: GameState;
   isLeader: boolean;
   isCorrect: boolean;
   isFunny: boolean;
   isPendingVote: boolean;
+  canVote: boolean;
   canGuessAuthors: boolean;
   revealComplete: boolean;
   guessedPlayerId: string;
@@ -1190,12 +1286,12 @@ function JudgingAnswerCard({ answer, state, isLeader, isCorrect, isFunny, isPend
   onVoteTap: (answerId: string) => void;
 }) {
   const myVote = state.myFunnyVoteId === answer.id;
-  const showFunnyVoteButton = !isLeader && !state.myFunnyVoteId;
+  const showFunnyVoteButton = canVote && !isLeader && !state.myFunnyVoteId;
   const showCorrectButton = isLeader && !state.mostCorrectAnswerId;
   const voteCount = state.funnyVoteCounts?.[answer.id] ?? 0;
   const revealVoteCount = Boolean(state.mostFunnyAnswerId);
   const answerTone = toneForAnswer(answer.id);
-  const reactionPicker = useAnswerReactionPicker(revealComplete);
+  const reactionPicker = useAnswerReactionPicker(revealComplete && canVote);
   const reactionPickerSpace = reactionPicker.open ? 'pt-16 ' : '';
   const border = isCorrect
     ? 'border-emerald-500'
@@ -1390,8 +1486,13 @@ function AnswerReactionPicker({ answerId, state, send, onPick, onClose }: {
   );
 }
 
-function RoundResults({ state, isLeader, isHost, send }: { state: GameState; isLeader: boolean; isHost: boolean; send: (t: string, p?: unknown) => void; }) {
+function RoundResults({ state, isLeader, isHost, ownerId, canAct, send }: { state: GameState; isLeader: boolean; isHost: boolean; ownerId: string | null; canAct: boolean; send: (t: string, p?: unknown) => void; }) {
   const r = state.lastResult;
+  const away = new Set(state.awayPlayerIds ?? []);
+  const currentLeaderId = state.players[state.currentLeaderIndex]?.id;
+  // Как и на сервере: если пропали и ведущий, и хост, продолжить может любой игрок.
+  const leaderAndHostAway = Boolean(currentLeaderId && away.has(currentLeaderId)) && (!ownerId || away.has(ownerId));
+  const canAdvance = canAct && (isLeader || isHost || leaderAndHostAway);
   const findText = (id: string | null) => state.answers.find((a) => a.id === id)?.text || '-';
   const leader = r ? state.players.find((player) => player.id === r.leaderId) : null;
   const leaderDelta = r ? (r.deltas[r.leaderId] ?? 0) : 0;
@@ -1448,7 +1549,7 @@ function RoundResults({ state, isLeader, isHost, send }: { state: GameState; isL
       )}
 
       <div className='mt-6'>
-        {(isLeader || isHost) ? (
+        {canAdvance ? (
           <button onClick={() => send('next_round')} className='btn-primary inline-flex w-full items-center justify-center gap-2 sm:w-auto'>
             {nextLabel}
             <ArrowRight className='h-4 w-4' />

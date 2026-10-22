@@ -18,7 +18,7 @@ type ServerEvent =
   | { type: 'player_kicked'; roomCode: string }
   | { type: 'room_closed'; roomCode: string; reason: string }
   | { type: 'pong' }
-  | { type: 'error'; message: string };
+  | { type: 'error'; message: string; code?: string; fatal?: boolean };
 
 type ClientCommand =
   | { type: 'player_action'; action: Omit<PlayerAction, 'playerId'> }
@@ -53,6 +53,10 @@ const SYNCS_WINDOW_MS = 60000;
 const SYNCS_THRESHOLD = 3;
 const ACTION_QUEUE_MAX_SIZE = 20;
 const HTTP_TIMEOUT_MS = 10000;
+const POLLING_WS_RETRY_BASE_MS = 30000;
+const POLLING_WS_RETRY_MAX_MS = 5 * 60 * 1000;
+/** Ответы сервера, после которых в эту комнату уже не попасть: удалён, комната пропала или заполнена. */
+const FATAL_IDENTIFY_STATUSES = new Set([403, 404, 409]);
 
 async function fetchWithTimeout(input: RequestInfo | URL, init: RequestInit = {}, timeoutMs = HTTP_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
@@ -123,7 +127,11 @@ function getStoredGender(): 'male' | 'female' {
   try { return localStorage.getItem('player_gender') === 'female' ? 'female' : 'male'; } catch { return 'male'; }
 }
 
-async function httpIdentify(roomCode: string, playerName: string, playerId: string, sessionId: string, wantsHost: boolean, gender: Gender, signal?: AbortSignal): Promise<{ playerId: string; sessionId: string; isHost: boolean } | null> {
+type HttpIdentifyResult =
+  | { ok: true; playerId: string; sessionId: string; isHost: boolean }
+  | { ok: false; status: number | null; error: string };
+
+async function httpIdentify(roomCode: string, playerName: string, playerId: string, sessionId: string, wantsHost: boolean, gender: Gender, signal?: AbortSignal): Promise<HttpIdentifyResult> {
   try {
     const response = await fetchWithTimeout(`${getServerBaseUrl()}/api/rooms/${roomCode}/identify`, {
       method: 'POST',
@@ -134,14 +142,14 @@ async function httpIdentify(roomCode: string, playerName: string, playerId: stri
     if (!response.ok) {
       const error = await response.json().catch(() => ({ error: 'HTTP identify failed' }));
       console.error('[http] identify failed', error);
-      return null;
+      return { ok: false, status: response.status, error: String(error.error || 'Не удалось войти в комнату') };
     }
 
     const data = await response.json() as { playerId: string; sessionId: string; isHost: boolean };
-    return data;
+    return { ok: true, ...data };
   } catch (error) {
     console.error('[http] identify error', error);
-    return null;
+    return { ok: false, status: null, error: error instanceof Error ? error.message : 'HTTP identify error' };
   }
 }
 
@@ -213,6 +221,7 @@ export function useGameRoom(
   const [connectionError, setConnectionError] = useState<string | null>(null);
   const [lobbyPlayers, setLobbyPlayers] = useState<LobbyPlayer[]>(restoredSession?.lobbyPlayers ?? []);
   const [isServerHost, setIsServerHost] = useState(restoredSession?.isHost ?? isHost);
+  const [ownerId, setOwnerId] = useState<string | null>(null);
   const [syncPending, setSyncPending] = useState(false);
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
   const [pendingActionsCount, setPendingActionsCount] = useState(0);
@@ -249,6 +258,7 @@ export function useGameRoom(
   const scheduleReconnectRef = useRef<() => void>(() => {});
   const protocolConnectedRef = useRef(false);
   const mountedRef = useRef(true);
+  const pollingUpgradeAttemptsRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -307,6 +317,7 @@ export function useGameRoom(
         roomCode: currentRoomCodeRef.current,
         myId,
         playerName,
+        gender: playerGender,
         isHost: isServerHost,
         sessionId,
         gameState,
@@ -320,7 +331,7 @@ export function useGameRoom(
         window.clearTimeout(saveTimerRef.current);
       }
     };
-  }, [gameState, isServerHost, lobbyPlayers, myId, playerName, sessionId]);
+  }, [gameState, isServerHost, lobbyPlayers, myId, playerName, playerGender, sessionId]);
 
   const requestWakeLock = useCallback(async () => {
     if (!('wakeLock' in navigator)) return;
@@ -347,6 +358,7 @@ export function useGameRoom(
 
   const applyServerSnapshot = useCallback((snapshot: PollingSnapshot) => {
     setLobbyPlayers(snapshot.lobby.players);
+    setOwnerId(snapshot.lobby.ownerId);
     setRoomCodeState(snapshot.lobby.roomCode);
     if (snapshot.game) {
       setGameState(snapshot.game);
@@ -408,6 +420,28 @@ export function useGameRoom(
     transportAbortRef.current?.abort();
     transportAbortRef.current = null;
   }, []);
+
+  /** Комнаты нет, игрока удалили или мест нет: переподключение бесполезно, раньше оно шло по кругу бесконечно. */
+  const handleFatalRoomError = useCallback((message: string) => {
+    shouldPersistRef.current = false;
+    intentionalLeaveRef.current = true;
+    protocolConnectedRef.current = false;
+    if (reconnectTimerRef.current) {
+      window.clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+    stopHeartbeat();
+    stopPolling();
+    releaseWakeLock();
+    clearActionOutbox();
+    clearGameSession();
+    socketRef.current?.close();
+    socketRef.current = null;
+    setConnectionStatus('disconnected');
+    setConnectionError(message);
+    toast.error(message);
+    navigate('/');
+  }, [clearActionOutbox, navigate, releaseWakeLock, stopHeartbeat, stopPolling]);
 
   const handlePollingFailure = useCallback((result: Extract<PollStateResult, { ok: false }>) => {
     if (result.status === 401) {
@@ -493,6 +527,24 @@ export function useGameRoom(
     }
   }, [stopPolling]);
 
+  const tryWebSocketFromPolling = useCallback(() => {
+    websocketRetryInPollingTimerRef.current = null;
+    if (!mountedRef.current || intentionalLeaveRef.current || connectionModeRef.current !== 'polling') return;
+    if (document.hidden) {
+      websocketRetryInPollingTimerRef.current = window.setTimeout(() => tryWebSocketFromPolling(), POLLING_WS_RETRY_BASE_MS);
+      return;
+    }
+    // Раньше резервный режим был «навсегда»: обновления раз в 2 с до перезагрузки страницы.
+    console.log('[ws] polling mode: trying to return to WebSocket');
+    pollingUpgradeAttemptsRef.current += 1;
+    stopPolling();
+    connectionModeRef.current = 'websocket';
+    setConnectionMode('websocket');
+    disconnectHistoryRef.current = [];
+    reconnectAttemptRef.current = 0;
+    connectRef.current?.();
+  }, [stopPolling]);
+
   const startPolling = useCallback(async () => {
     if (isPollingActiveRef.current) return;
     isPollingActiveRef.current = true;
@@ -529,7 +581,11 @@ export function useGameRoom(
     const identity = latestIdentityRef.current;
     const result = await httpIdentify(targetRoomCode, playerName, identity.myId, identity.sessionId, identity.isHost, playerGender, transportController.signal);
     if (!mountedRef.current || transportController.signal.aborted) return;
-    if (result) {
+    if (result.ok === false && result.status !== null && FATAL_IDENTIFY_STATUSES.has(result.status)) {
+      handleFatalRoomError(result.error);
+      return;
+    }
+    if (result.ok) {
       setMyId(result.playerId);
       setSessionId(result.sessionId);
       setIsServerHost(result.isHost);
@@ -575,8 +631,10 @@ export function useGameRoom(
     if (!mountedRef.current || !isPollingActiveRef.current || transportController.signal.aborted) return;
     setConnectionStatus('polling');
     pollingTimerRef.current = window.setInterval(poll, POLLING_INTERVAL_MS);
+    const retryDelay = Math.min(POLLING_WS_RETRY_BASE_MS * 2 ** pollingUpgradeAttemptsRef.current, POLLING_WS_RETRY_MAX_MS);
+    websocketRetryInPollingTimerRef.current = window.setTimeout(tryWebSocketFromPolling, retryDelay);
 
-  }, [applyServerSnapshot, flushActionQueue, handlePollingFailure, isHost, playerName, playerGender, recoverPollingStartup, requeuePendingActions, stopHeartbeat, stopPolling]);
+  }, [applyServerSnapshot, flushActionQueue, handleFatalRoomError, handlePollingFailure, isHost, playerName, playerGender, recoverPollingStartup, requeuePendingActions, stopHeartbeat, stopPolling, tryWebSocketFromPolling]);
 
   const scheduleReconnect = useCallback(() => {
     if (intentionalLeaveRef.current) return;
@@ -891,7 +949,13 @@ export function useGameRoom(
 
           resetHeartbeatTimeout();
 
-          const payload = JSON.parse(event.data) as ServerEvent;
+          let payload: ServerEvent;
+          try {
+            payload = JSON.parse(event.data) as ServerEvent;
+          } catch {
+            console.warn('[ws] ignoring malformed message');
+            return;
+          }
 
           switch (payload.type) {
             case 'pong':
@@ -908,11 +972,13 @@ export function useGameRoom(
               disconnectHistoryRef.current = [];
               syncHistoryRef.current = [];
               reconnectAttemptRef.current = 0;
+              pollingUpgradeAttemptsRef.current = 0;
               setReconnectAttempt(0);
               flushActionQueue();
               break;
             case 'lobby_state':
               setLobbyPlayers(payload.players);
+              setOwnerId(payload.ownerId);
               setSyncPending(false);
               if (syncTimeoutRef.current) {
                 window.clearTimeout(syncTimeoutRef.current);
@@ -968,6 +1034,10 @@ export function useGameRoom(
               navigate('/');
               break;
             case 'error':
+              if (payload.fatal) {
+                handleFatalRoomError(payload.message);
+                break;
+              }
               setConnectionError(payload.message);
               toast.error(payload.message);
               if (!latestIdentityRef.current.myId) {
@@ -1074,13 +1144,16 @@ export function useGameRoom(
         window.clearTimeout(saveTimerRef.current);
       }
     };
-  }, [isHost, navigate, playerName, playerGender, reconnect, scheduleReconnect, startHeartbeat, stopHeartbeat, stopPolling, releaseWakeLock, startPolling, recordDisconnect, flushActionQueue, resetHeartbeatTimeout, requestWakeLock, requeuePendingActions, updatePendingActionsCount]);
+  }, [isHost, navigate, playerName, playerGender, reconnect, scheduleReconnect, startHeartbeat, stopHeartbeat, stopPolling, releaseWakeLock, startPolling, recordDisconnect, flushActionQueue, resetHeartbeatTimeout, requestWakeLock, requeuePendingActions, updatePendingActionsCount, handleFatalRoomError]);
 
   const connected = connectionStatus === 'connected' || connectionStatus === 'polling';
 
   return {
     gameState,
     myId,
+    // Хост берётся с сервера: права могут перейти к другому игроку, а параметр host в URL этого не знает.
+    isHost: ownerId ? ownerId === myId : isServerHost,
+    ownerId,
     roomCode: roomCodeState,
     connected,
     connectionStatus,

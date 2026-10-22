@@ -8,6 +8,7 @@ export interface GameSession {
   roomCode: string;
   myId: string;
   playerName: string;
+  gender?: Gender;
   isHost: boolean;
   sessionId?: string;
   gameState: GameState | null;
@@ -86,6 +87,7 @@ export function saveGameSession(session: GameSession): void {
       roomCode: session.roomCode,
       myId: session.myId,
       playerName: session.playerName,
+      gender: session.gender,
       isHost: session.isHost,
       sessionId: session.sessionId,
       lobbyPlayers: session.lobbyPlayers,

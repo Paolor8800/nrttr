@@ -62,6 +62,8 @@ export interface GameState {
   myAnswerReactions: MyAnswerReactions;
   funnyVoteCounts: FunnyVoteCounts;
   funnyVotesSubmittedCount: number;
+  /** Сколько голосов нужно для выбора «самого смешного»; нет в старых сохранённых сессиях. */
+  funnyVotesRequiredCount?: number;
   myFunnyVoteId: string | null;
   correctAnswer: string;
   mostCorrectAnswerId: string | null;
@@ -70,6 +72,8 @@ export interface GameState {
   lastResult: RoundResult | null;
   winnerId: string | null;
   casinoLastSpins: Record<string, CasinoSpinResult>;
+  /** Игроки, которые давно не в сети и которых раунд не ждёт. */
+  awayPlayerIds?: string[];
   roomCode: string;
   hostId: string;
 }
@@ -83,7 +87,11 @@ export type PlayerAction = (
   | { type: 'casino_spin'; playerId: string; payload: { betType: CasinoBetType; betNumber?: number | null } }
   | { type: 'finish_judging'; playerId: string; payload?: Record<string, never> }
   | { type: 'next_round'; playerId: string; payload?: Record<string, never> }
-) & { actionId?: string };
+) & {
+  actionId?: string;
+  round?: number;
+  questionId?: string | null;
+};
 
 export interface LobbyPlayer {
   id: string;

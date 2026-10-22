@@ -12,3 +12,6 @@ dist
 server-dist
 tmp-ui-shots/
 .DS_Store
+# Резервные копии редакторов
+nppBackup/
+*.bak

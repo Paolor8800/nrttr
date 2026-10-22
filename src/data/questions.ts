@@ -81,9 +81,16 @@ export const QUESTIONS: Question[] = [
   { id: 'q58', target: 'any',    template: 'На что {name} тратит деньги без единого сомнения?' },
   { id: 'q59', target: 'any',    template: 'Как {name} выкручивается из неловкой ситуации?' },
   { id: 'q60', target: 'any',    template: 'О чём {name} думает перед сном?' },
-  { id: 'q61', target: 'any',    template: 'Какой странный талант есть у {name}?' },
+  { id: 'q61', target: 'any',    template: 'Что {name} больше всего бесит в людях?' },
   { id: 'q62', target: 'any',    template: 'Что {name} скажет, если {его|ее} поймают на краже?' },
   { id: 'q63', target: 'any',    template: 'Чем гордится {name}, хотя это выглядит сомнительно?' },
+  { id: 'q64', target: 'any',    template: 'О чем думает {name} прямо сейчас?'},
+  { id: 'q65', target: 'any',    template: 'Что {name} говорит во время секса?'},
+  { id: 'q66', target: 'any',    template: 'Какая кличка была бы у {name} если бы ее придумали сейчас?'},
+  { id: 'q67', target: 'any',    template: 'Опишите {name} крылатой фразой или поговоркой'},
+  { id: 'q68', target: 'any',    template: 'Худшее качесво которое есть у {name}'},
+  { id: 'q69', target: 'any',    template: 'Как имя лучшей подруги/друга у {name}'},
+  { id: 'q70', target: 'any',    template: 'Какая любимая поза в сексе у {name}'},
 ];
 
 

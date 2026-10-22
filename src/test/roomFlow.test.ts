@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { Room } from '../../server/room';
+import { CASINO_SPIN_COOLDOWN_MS, Room } from '../../server/room';
 import { HOST_ANSWER_REACTION_ID } from '../../server/shared-types';
 import { questionsForGender } from '@/data/questions';
 
@@ -59,7 +59,7 @@ describe('room flow', () => {
     room.startGame();
 
     const player = room.gameState!.players.find((p) => p.id === 'p2')!;
-    player.score = 14;
+    player.score = 29;
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       room.processAction('p2', {
@@ -75,7 +75,7 @@ describe('room flow', () => {
     expect(spin.resultNumber).toBe(0);
     expect(spin.won).toBe(true);
     expect(spin.scoreDelta).toBe(6);
-    expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(20);
+    expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(35);
     expect(room.gameState!.phase).toBe('answering');
 
     room.gameState!.phase = 'roundResults';
@@ -85,14 +85,15 @@ describe('room flow', () => {
     expect(room.gameState!.winnerId).toBe('p2');
   });
 
-  it('forces five casino losses when a player starts a spin at 18 or 19 points', () => {
+  it('forces five casino losses when a player starts a spin at 32–34 points', () => {
     const room = new Room('CASIN3');
     room.addOrUpdatePlayer('p1', 'Host', true, 'female');
     room.addOrUpdatePlayer('p2', 'Player 2', false, 'male');
     room.addOrUpdatePlayer('p3', 'Player 3', false, 'female');
     room.startGame();
 
-    room.gameState!.players.find((p) => p.id === 'p2')!.score = 19;
+    room.gameState!.players.find((p) => p.id === 'p2')!.score = 34;
+    vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random').mockReturnValue(0);
     try {
       for (let index = 0; index < 5; index += 1) {
@@ -101,6 +102,7 @@ describe('room flow', () => {
           playerId: 'p2',
           payload: { betType: 'zero' },
         });
+        vi.advanceTimersByTime(CASINO_SPIN_COOLDOWN_MS);
 
         const spin = room.gameState!.casinoLastSpins.p2;
         expect(spin.resultNumber).not.toBe(0);
@@ -108,7 +110,7 @@ describe('room flow', () => {
         expect(spin.scoreDelta).toBe(-1);
       }
 
-      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(14);
+      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(29);
 
       room.processAction('p2', {
         type: 'casino_spin',
@@ -120,20 +122,22 @@ describe('room flow', () => {
       expect(randomSpin.resultNumber).toBe(0);
       expect(randomSpin.won).toBe(true);
       expect(randomSpin.scoreDelta).toBe(6);
-      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(20);
+      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(35);
     } finally {
       randomSpy.mockRestore();
+      vi.useRealTimers();
     }
   });
 
-  it('starts the five-loss casino streak after a random win reaches 18 or 19 points', () => {
+  it('starts the five-loss casino streak after a random win reaches 32 points', () => {
     const room = new Room('CASIN4');
     room.addOrUpdatePlayer('p1', 'Host', true, 'female');
     room.addOrUpdatePlayer('p2', 'Player 2', false, 'male');
     room.addOrUpdatePlayer('p3', 'Player 3', false, 'female');
     room.startGame();
 
-    room.gameState!.players.find((p) => p.id === 'p2')!.score = 16;
+    room.gameState!.players.find((p) => p.id === 'p2')!.score = 30;
+    vi.useFakeTimers();
     const randomSpy = vi.spyOn(Math, 'random')
       .mockReturnValueOnce(0.03)
       .mockReturnValue(0);
@@ -147,7 +151,8 @@ describe('room flow', () => {
       const winningSpin = room.gameState!.casinoLastSpins.p2;
       expect(winningSpin.resultNumber).toBe(1);
       expect(winningSpin.won).toBe(true);
-      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(18);
+      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(32);
+      vi.advanceTimersByTime(CASINO_SPIN_COOLDOWN_MS);
 
       room.processAction('p2', {
         type: 'casino_spin',
@@ -158,9 +163,10 @@ describe('room flow', () => {
       const forcedSpin = room.gameState!.casinoLastSpins.p2;
       expect(forcedSpin.resultNumber).not.toBe(0);
       expect(forcedSpin.won).toBe(false);
-      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(17);
+      expect(room.gameState!.players.find((p) => p.id === 'p2')!.score).toBe(31);
     } finally {
       randomSpy.mockRestore();
+      vi.useRealTimers();
     }
   });
 

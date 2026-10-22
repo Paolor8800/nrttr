@@ -12,7 +12,7 @@ function envMs(name: string, fallback: number): number {
   return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
-const TARGET_SCORE = 20; // первый, кто набирает столько очков — победитель
+export const TARGET_SCORE = 35; // первый, кто набирает столько очков — победитель
 const LOBBY_RESERVATION_TTL_MS = 5 * 60 * 1000;
 const EMPTY_ROOM_TTL_MS = 5 * 60 * 1000;
 /** Компания может уйти на долгий перерыв с выключенными телефонами — партия должна дождаться. */
@@ -37,8 +37,11 @@ const CASINO_PAYOUTS: Record<CasinoBetType, number> = {
   number: 4,
   zero: 6,
 };
-const CASINO_ENDGAME_FORCE_SCORES = new Set([18, 19]);
-const CASINO_FORCED_LOSS_COUNT = 5;
+/** С этого счёта и до победного очередная серия ставок в казино проигрывает: казино не должно решать финал. */
+export const CASINO_FORCED_LOSS_FROM_SCORE = 32;
+export const CASINO_FORCED_LOSS_COUNT = 5;
+/** Колесо крутится 7,6 с, поэтому живой игрок чаще не ставит; отсекаются дубли запросов и скрипты. */
+export const CASINO_SPIN_COOLDOWN_MS = 5000;
 
 type NormalizedCasinoBet = { betType: CasinoBetType; betNumber: number | null };
 
@@ -75,6 +78,10 @@ function normalizeCasinoBet(payload: unknown): NormalizedCasinoBet | null {
     }
   }
   return null;
+}
+
+function isCasinoForcedLossScore(score: number, targetScore: number): boolean {
+  return score >= CASINO_FORCED_LOSS_FROM_SCORE && score < targetScore;
 }
 
 function casinoBetWins(bet: NormalizedCasinoBet, resultNumber: number): boolean {
@@ -148,6 +155,7 @@ export class Room {
   /** Уже заданные id вопросов в серии игр этой комнаты. */
   private usedQuestionIds: string[] = [];
   private casinoForcedLosses = new Map<string, number>();
+  private lastCasinoSpinAt = new Map<string, number>();
   /** Последний выбор при ничьей за «самый смешной», чтобы он не менялся при каждом пересчёте. */
   private funnyTieBreak: { key: string; winner: string } | null = null;
   /** Когда игрок последний раз был виден по HTTP (резервный режим без WebSocket). */
@@ -297,6 +305,7 @@ export class Room {
       this.usedQuestionIds = [];
     }
     this.casinoForcedLosses.clear();
+    this.lastCasinoSpinAt.clear();
     this.gameState = {
       phase: 'answering',
       round: 0,
@@ -545,17 +554,17 @@ export class Room {
   private advanceToNextRound(): GameEvent[] {
     const state = this.gameState!;
 
-    // Победа по очкам: первый, кто достиг TARGET_SCORE, заканчивает игру.
-    const reached = state.players.filter((p) => p.score >= state.targetScore);
-    if (reached.length > 0) {
-      const top = reached.reduce((a, b) => (b.score > a.score ? b : a));
+    // Победа по очкам: как только кто-то достиг TARGET_SCORE, игра заканчивается.
+    if (state.players.some((p) => p.score >= state.targetScore)) {
       state.phase = 'gameOver';
-      state.winnerId = top.id;
+      // При равном лучшем счёте — ничья; раньше побеждал тот, кто стоял выше в списке игроков.
+      state.winnerId = pickWinnerId(state.players);
       return [{ type: 'game_over', winnerId: state.winnerId }];
     }
 
     state.round += 1;
-    state.currentLeaderIndex = (state.currentLeaderIndex + 1) % state.players.length;
+    state.currentLeaderIndex = this.nextPresentLeaderIndex(state.currentLeaderIndex)
+      ?? (state.currentLeaderIndex + 1) % state.players.length;
     this.beginRound();
     const leader = state.players[state.currentLeaderIndex];
     return [{
@@ -650,21 +659,28 @@ export class Room {
     return fingerprint() !== before;
   }
 
+  /** Следующий по кругу игрок, который в сети; null — все остальные давно офлайн. */
+  private nextPresentLeaderIndex(fromIndex: number): number | null {
+    const state = this.gameState!;
+    const total = state.players.length;
+    for (let step = 1; step < total; step += 1) {
+      const index = (fromIndex + step) % total;
+      if (!this.isPlayerAway(state.players[index].id)) return index;
+    }
+    return null;
+  }
+
   private skipAwayLeaderTurn(): GameEvent[] {
     const state = this.gameState!;
     const leader = state.players[state.currentLeaderIndex];
     if (!leader || !this.isPlayerAway(leader.id, LEADER_AWAY_GRACE_MS)) return [];
-    const total = state.players.length;
-    for (let step = 1; step < total; step += 1) {
-      const candidateIndex = (state.currentLeaderIndex + step) % total;
-      if (this.isPlayerAway(state.players[candidateIndex].id)) continue;
-      state.currentLeaderIndex = candidateIndex;
-      state.round += 1;
-      this.beginRound();
-      const next = state.players[candidateIndex];
-      return [{ type: 'round_started', leaderId: next.id, leaderName: next.name, questionText: state.questionText, round: state.round }];
-    }
-    return [];
+    const candidateIndex = this.nextPresentLeaderIndex(state.currentLeaderIndex);
+    if (candidateIndex === null) return [];
+    state.currentLeaderIndex = candidateIndex;
+    state.round += 1;
+    this.beginRound();
+    const next = state.players[candidateIndex];
+    return [{ type: 'round_started', leaderId: next.id, leaderName: next.name, questionText: state.questionText, round: state.round }];
   }
 
   pruneExpiredLobbyReservations() {
@@ -722,6 +738,7 @@ export class Room {
     state.players = state.players.filter((p) => p.id !== playerId);
     delete state.casinoLastSpins[playerId];
     this.casinoForcedLosses.delete(playerId);
+    this.lastCasinoSpinAt.delete(playerId);
     this.submissions.delete(playerId);
     this.pruneJudgingAnswerByPlayer(playerId);
     for (const reactions of Object.values(this.answerReactionPlayers)) {
@@ -788,6 +805,7 @@ export class Room {
     this.funniestVotes.clear();
     this.usedQuestionIds = [];
     this.casinoForcedLosses.clear();
+    this.lastCasinoSpinAt.clear();
     this.processedActionIds.clear();
     this.lastSeenAt.clear();
     this.funnyTieBreak = null;
@@ -930,13 +948,19 @@ export class Room {
         const bet = normalizeCasinoBet(action.payload);
         const player = state.players.find((p) => p.id === playerId);
         if (!bet || !player || player.score < 1) break;
+        const now = Date.now();
+        if (now - (this.lastCasinoSpinAt.get(playerId) ?? 0) < CASINO_SPIN_COOLDOWN_MS) {
+          throw new Error('Рулетка ещё крутится — дождись результата');
+        }
+        this.lastCasinoSpinAt.set(playerId, now);
 
         let forcedLossesRemaining = this.casinoForcedLosses.get(playerId) ?? 0;
-        if (forcedLossesRemaining <= 0 && CASINO_ENDGAME_FORCE_SCORES.has(player.score)) {
+        if (forcedLossesRemaining <= 0 && isCasinoForcedLossScore(player.score, state.targetScore)) {
           forcedLossesRemaining = CASINO_FORCED_LOSS_COUNT;
         }
 
-        const forceLoss = forcedLossesRemaining > 0;
+        // Остаток серии не действует на того, кто уже набрал победный счёт в раундах.
+        const forceLoss = forcedLossesRemaining > 0 && player.score < state.targetScore;
         const resultNumber = forceLoss ? pickCasinoLossNumber(bet) : pickCasinoNumber();
         const resultColor = rouletteColorForNumber(resultNumber);
         const won = forceLoss ? false : casinoBetWins(bet, resultNumber);
@@ -954,7 +978,7 @@ export class Room {
           } else {
             this.casinoForcedLosses.delete(playerId);
           }
-        } else if (CASINO_ENDGAME_FORCE_SCORES.has(nextScore)) {
+        } else if (isCasinoForcedLossScore(nextScore, state.targetScore)) {
           this.casinoForcedLosses.set(playerId, CASINO_FORCED_LOSS_COUNT);
         } else {
           this.casinoForcedLosses.delete(playerId);

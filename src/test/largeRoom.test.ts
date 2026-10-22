@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { LEADER_AWAY_GRACE_MS, normalizePlayerName, PLAYER_AWAY_GRACE_MS, Room, RoomError } from '../../server/room';
+import { ABANDONED_ROOM_TTL_MS, LEADER_AWAY_GRACE_MS, normalizePlayerName, PLAYER_AWAY_GRACE_MS, Room, RoomError } from '../../server/room';
 import type { PlayerAction } from '../../server/shared-types';
 import { MAX_PLAYERS } from '@/lib/roomLimits';
 
@@ -292,11 +292,13 @@ describe('large rooms (13–16 players)', () => {
     expect(room.players.get('p2')?.connected).toBe(true);
   });
 
-  it('cleans up a room where everyone has been offline for a long time, even mid-game', () => {
+  it('keeps a paused game through a long break but cleans it up eventually', () => {
     const room = roomWithPlayers(3);
     room.startGame();
     ['p1', 'p2', 'p3'].forEach((id) => room.markDisconnected(id));
-    vi.advanceTimersByTime(29 * 60 * 1000);
+    vi.advanceTimersByTime(60 * 60 * 1000);
+    expect(room.isStale()).toBe(false);
+    vi.advanceTimersByTime(ABANDONED_ROOM_TTL_MS - 60 * 60 * 1000 - 60 * 1000);
     expect(room.isStale()).toBe(false);
     vi.advanceTimersByTime(60 * 1000);
     expect(room.isStale()).toBe(true);

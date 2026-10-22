@@ -15,7 +15,8 @@ function envMs(name: string, fallback: number): number {
 const TARGET_SCORE = 20; // первый, кто набирает столько очков — победитель
 const LOBBY_RESERVATION_TTL_MS = 5 * 60 * 1000;
 const EMPTY_ROOM_TTL_MS = 5 * 60 * 1000;
-const ABANDONED_ROOM_TTL_MS = 30 * 60 * 1000;
+/** Компания может уйти на долгий перерыв с выключенными телефонами — партия должна дождаться. */
+export const ABANDONED_ROOM_TTL_MS = 6 * 60 * 60 * 1000;
 const PROCESSED_ACTION_IDS_LIMIT = 2000;
 /** Через столько офлайна игрок перестаёт блокировать ответы и голосование. */
 export const PLAYER_AWAY_GRACE_MS = envMs('PLAYER_AWAY_GRACE_MS', 30_000);
@@ -268,7 +269,7 @@ export class Room {
     return this.players.size >= MIN_PLAYERS;
   }
 
-  /** Пустая комната живёт 5 минут, комната, где все офлайн, — 30 минут (раньше партии не чистились никогда). */
+  /** Пустая комната живёт 5 минут, комната, где все офлайн, — 6 часов (раньше партии не чистились никогда). */
   isStale(now = Date.now()) {
     const anyoneConnected = Array.from(this.players.values()).some((player) => player.connected !== false);
     if (anyoneConnected) return false;
